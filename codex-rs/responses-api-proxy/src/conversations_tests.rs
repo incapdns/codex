@@ -259,16 +259,17 @@ async fn rewrites_streaming_response_and_persists_completed_output() {
         "created_at": 123,
         "status": "completed",
         "model": "gpt-test",
-        "output": [{
+        "output": []
+    });
+    let completed_item = serde_json::json!({
             "id": "msg_answer",
             "type": "message",
             "status": "completed",
             "role": "assistant",
             "content": [{"type": "output_text", "text": "answer", "annotations": []}]
-        }]
     });
     let sse = format!(
-        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        "event: response.created\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
         serde_json::json!({
             "type": "response.created",
             "response": {
@@ -280,11 +281,16 @@ async fn rewrites_streaming_response_and_persists_completed_output() {
                 "output": []
             }
         }),
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "item": completed_item
+        }),
         serde_json::json!({"type": "response.completed", "response": response_object})
     );
     Mock::given(method("POST"))
         .and(path("/backend-api/codex/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        // The production backend may omit the SSE content type even when `stream: true`.
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "application/octet-stream"))
         .mount(&server)
         .await;
     let state = test_state(&server, Some(store.clone()));
@@ -303,7 +309,9 @@ async fn rewrites_streaming_response_and_persists_completed_output() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains(&format!(r#""conversation":{{"id":"{conversation_id}"}}"#)));
-    assert!(body.ends_with("data: [DONE]\n\n"));
+    assert!(body.contains("event: response.created\n"));
+    assert!(body.contains("event: response.output_item.done\n"));
+    assert!(body.contains("event: response.completed\n"));
 
     let items = store
         .list_items(

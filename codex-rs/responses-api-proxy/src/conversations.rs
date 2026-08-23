@@ -803,7 +803,12 @@ impl ConversationStore {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"));
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+            || prepared
+                .payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         if is_sse {
             self.adapt_sse_response(upstream, prepared, exchange_dump)
         } else {
@@ -824,6 +829,7 @@ impl ConversationStore {
         tokio::spawn(async move {
             let mut events = Box::pin(upstream.bytes_stream().eventsource());
             let mut terminal = false;
+            let mut completed_output = Vec::new();
             while let Some(event) = events.next().await {
                 let event = match event {
                     Ok(event) => event,
@@ -833,29 +839,33 @@ impl ConversationStore {
                     }
                 };
                 if event.data == "[DONE]" {
-                    let _ = sender
-                        .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
-                        .await;
+                    let _ = sender.send(Ok(encode_sse(&event.event, "[DONE]"))).await;
                     continue;
                 }
                 let mut value: Value = match serde_json::from_str(&event.data) {
                     Ok(value) => value,
                     Err(_) => {
-                        let _ = sender
-                            .send(Ok(Bytes::from(format!("data: {}\n\n", event.data))))
-                            .await;
+                        let _ = sender.send(Ok(encode_sse(&event.event, &event.data))).await;
                         continue;
                     }
                 };
                 attach_conversation(&mut value, &prepared.conversation_id);
                 match value.get("type").and_then(Value::as_str) {
+                    Some("response.output_item.done") => {
+                        if let Some(item) = value.get("item").cloned() {
+                            completed_output.push(item);
+                        }
+                    }
                     Some("response.completed" | "response.incomplete") => {
-                        let output = value
-                            .get("response")
-                            .and_then(|response| response.get("output"))
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
+                        let mut output = std::mem::take(&mut completed_output);
+                        output.extend(
+                            value
+                                .get("response")
+                                .and_then(|response| response.get("output"))
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
                         if let Err(err) = self.complete_response(&prepared, output).await {
                             eprintln!(
                                 "responses-api-proxy failed to persist conversation response: {err}"
@@ -870,7 +880,7 @@ impl ConversationStore {
                     _ => {}
                 }
                 let _ = sender
-                    .send(Ok(Bytes::from(format!("data: {value}\n\n"))))
+                    .send(Ok(encode_sse(&event.event, &value.to_string())))
                     .await;
             }
             if !terminal {
@@ -933,6 +943,14 @@ impl ConversationStore {
 }
 
 type CompatStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
+
+fn encode_sse(event: &str, data: &str) -> Bytes {
+    if event.is_empty() {
+        Bytes::from(format!("data: {data}\n\n"))
+    } else {
+        Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
+    }
+}
 
 fn downstream_response(
     status: StatusCode,
