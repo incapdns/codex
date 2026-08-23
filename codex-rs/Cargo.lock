@@ -4009,15 +4009,27 @@ name = "codex-responses-api-proxy"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "bytes",
  "clap",
+ "codex-core",
+ "codex-http-client",
+ "codex-login",
+ "codex-model-provider",
  "codex-process-hardening",
+ "codex-utils-cli",
  "ctor 0.6.3",
+ "futures",
+ "http 1.4.0",
  "libc",
  "pretty_assertions",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tiny_http",
+ "tokio",
+ "tokio-util",
+ "wiremock",
  "zeroize",
 ]
 

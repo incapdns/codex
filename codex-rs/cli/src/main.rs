@@ -1763,12 +1763,14 @@ async fn cli_main(
             );
             run_apply_command(apply_cli, /*cwd*/ None).await?;
         }
-        Some(Subcommand::ResponsesApiProxy(args)) => {
+        Some(Subcommand::ResponsesApiProxy(mut args)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
                 "responses-api-proxy",
             )?;
+            args.config_overrides
+                .prepend_root_overrides(root_config_overrides.clone());
             tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
                 .await??;
         }

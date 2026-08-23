@@ -13,6 +13,8 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
+use clap::ValueEnum;
+use codex_utils_cli::CliConfigOverrides;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::AUTHORIZATION;
@@ -28,15 +30,37 @@ use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
 
+mod chatgpt;
 mod dump;
 mod read_api_key;
 use dump::ExchangeDumper;
 use read_api_key::read_auth_header_from_stdin;
 
+/// Credential source used for upstream requests.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+pub enum ProxyAuth {
+    /// Read an OpenAI API key from stdin, preserving the proxy's original behavior.
+    #[default]
+    Stdin,
+    /// Load and refresh the managed ChatGPT login from the Codex configuration.
+    Chatgpt,
+}
+
 /// CLI arguments for the proxy.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "responses-api-proxy", about = "Minimal OpenAI responses proxy")]
 pub struct Args {
+    /// Credential source used for upstream requests.
+    #[arg(long, value_enum, default_value_t)]
+    pub auth: ProxyAuth,
+
+    #[command(flatten)]
+    pub config_overrides: CliConfigOverrides,
+
+    /// Fail if config.toml contains unknown configuration fields.
+    #[arg(long, default_value_t = false)]
+    pub strict_config: bool,
+
     /// Port to listen on. If not set, an ephemeral port is used.
     #[arg(long)]
     pub port: Option<u16>,
@@ -49,9 +73,11 @@ pub struct Args {
     #[arg(long)]
     pub http_shutdown: bool,
 
-    /// Absolute URL the proxy should forward requests to (defaults to OpenAI).
-    #[arg(long, default_value = "https://api.openai.com/v1/responses")]
-    pub upstream_url: String,
+    /// Absolute URL the proxy should forward requests to.
+    ///
+    /// Defaults to OpenAI for stdin auth and the configured Codex backend for ChatGPT auth.
+    #[arg(long)]
+    pub upstream_url: Option<String>,
 
     /// Directory where request/response dumps should be written as JSON.
     #[arg(long, value_name = "DIR")]
@@ -59,7 +85,7 @@ pub struct Args {
 }
 
 #[derive(Serialize)]
-struct ServerInfo {
+pub(crate) struct ServerInfo {
     port: u16,
     pid: u32,
 }
@@ -71,9 +97,21 @@ struct ForwardConfig {
 
 /// Entry point for the library main, for parity with other crates.
 pub fn run_main(args: Args) -> Result<()> {
+    match args.auth {
+        ProxyAuth::Stdin => run_api_key_proxy(args),
+        ProxyAuth::Chatgpt => chatgpt::run_main(args),
+    }
+}
+
+fn run_api_key_proxy(args: Args) -> Result<()> {
     let auth_header = read_auth_header_from_stdin()?;
 
-    let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
+    let upstream_url = Url::parse(
+        args.upstream_url
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1/responses"),
+    )
+    .context("parsing --upstream-url")?;
     let host = match (upstream_url.host_str(), upstream_url.port()) {
         (Some(host), Some(port)) => format!("{host}:{port}"),
         (Some(host), None) => host.to_string(),
@@ -135,14 +173,14 @@ pub fn run_main(args: Args) -> Result<()> {
     Err(anyhow!("server stopped unexpectedly"))
 }
 
-fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
+pub(crate) fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));
     let listener = TcpListener::bind(addr).with_context(|| format!("failed to bind {addr}"))?;
     let bound = listener.local_addr().context("failed to read local_addr")?;
     Ok((listener, bound))
 }
 
-fn write_server_info(path: &Path, port: u16) -> Result<()> {
+pub(crate) fn write_server_info(path: &Path, port: u16) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -159,6 +197,10 @@ fn write_server_info(path: &Path, port: u16) -> Result<()> {
     f.write_all(data.as_bytes())?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
 
 fn forward_request(
     client: &Client,

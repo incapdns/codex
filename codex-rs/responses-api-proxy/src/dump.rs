@@ -2,11 +2,16 @@ use std::fs;
 use std::io;
 use std::io::Read;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use bytes::Bytes;
+use futures::Stream;
 use reqwest::header::HeaderMap;
 use serde::Serialize;
 use serde_json::Value;
@@ -38,6 +43,36 @@ impl ExchangeDumper {
         headers: &[Header],
         body: &[u8],
     ) -> io::Result<ExchangeDump> {
+        self.dump_request_parts(
+            method.as_str(),
+            url,
+            headers.iter().map(HeaderDump::from).collect(),
+            body,
+        )
+    }
+
+    pub(crate) fn dump_http_request(
+        &self,
+        method: &http::Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> io::Result<ExchangeDump> {
+        self.dump_request_parts(
+            method.as_str(),
+            url,
+            headers.iter().map(HeaderDump::from).collect(),
+            body,
+        )
+    }
+
+    fn dump_request_parts(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Vec<HeaderDump>,
+        body: &[u8],
+    ) -> io::Result<ExchangeDump> {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -48,9 +83,9 @@ impl ExchangeDumper {
         let response_path = self.dump_dir.join(format!("{prefix}-response.json"));
 
         let request_dump = RequestDump {
-            method: method.as_str().to_string(),
+            method: method.to_string(),
             url: url.to_string(),
-            headers: headers.iter().map(HeaderDump::from).collect(),
+            headers,
             body: dump_body(body),
         };
 
@@ -73,6 +108,25 @@ impl ExchangeDump {
     ) -> ResponseBodyDump<R> {
         ResponseBodyDump {
             response_body,
+            response_path: self.response_path,
+            status,
+            headers: headers.iter().map(HeaderDump::from).collect(),
+            body: Vec::new(),
+            dump_written: false,
+        }
+    }
+
+    pub(crate) fn tee_response_stream<S, E>(
+        self,
+        status: u16,
+        headers: &HeaderMap,
+        response_body: S,
+    ) -> ResponseBodyDumpStream<S>
+    where
+        S: Stream<Item = Result<Bytes, E>>,
+    {
+        ResponseBodyDumpStream {
+            response_body: Box::pin(response_body),
             response_path: self.response_path,
             status,
             headers: headers.iter().map(HeaderDump::from).collect(),
@@ -128,6 +182,65 @@ impl<R: Read> Read for ResponseBodyDump<R> {
 }
 
 impl<R> Drop for ResponseBodyDump<R> {
+    fn drop(&mut self) {
+        self.write_dump_if_needed();
+    }
+}
+
+pub(crate) struct ResponseBodyDumpStream<S> {
+    response_body: Pin<Box<S>>,
+    response_path: PathBuf,
+    status: u16,
+    headers: Vec<HeaderDump>,
+    body: Vec<u8>,
+    dump_written: bool,
+}
+
+impl<S> ResponseBodyDumpStream<S> {
+    fn write_dump_if_needed(&mut self) {
+        if self.dump_written {
+            return;
+        }
+
+        self.dump_written = true;
+        let response_dump = ResponseDump {
+            status: self.status,
+            headers: std::mem::take(&mut self.headers),
+            body: dump_body(&self.body),
+        };
+        if let Err(err) = write_json_dump(&self.response_path, &response_dump) {
+            eprintln!(
+                "responses-api-proxy failed to write {}: {err}",
+                self.response_path.display()
+            );
+        }
+    }
+}
+
+impl<S, E> Stream for ResponseBodyDumpStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.response_body.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                this.body.extend_from_slice(&bytes);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => {
+                this.write_dump_if_needed();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for ResponseBodyDumpStream<S> {
     fn drop(&mut self) {
         self.write_dump_if_needed();
     }

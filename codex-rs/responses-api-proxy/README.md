@@ -2,6 +2,21 @@
 
 #### tl;dr:
 
+Use the existing Codex ChatGPT login and expose it as a local Responses API:
+
+```shell
+codex responses-api-proxy --auth chatgpt --port 60001
+
+curl http://127.0.0.1:60001/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.1-codex","input":"Hello","stream":true}'
+```
+
+The ChatGPT mode loads the normal Codex configuration and credentials. Run `codex login` first;
+clients of the local endpoint do not supply an `Authorization` header.
+
+To proxy an OpenAI API key instead:
+
 ```
 # Launch the proxy, dump request/response pairs to /tmp/proxy
 cd path/to/codex/codex-rs
@@ -28,11 +43,39 @@ codex -p proxy
 
 # Detailed docs
 
-A strict HTTP proxy that only forwards `POST` requests to `/v1/responses` to the OpenAI API (`https://api.openai.com`), injecting the `Authorization: Bearer $OPENAI_API_KEY` header. Everything else is rejected with `403 Forbidden`.
+A strict HTTP proxy that only forwards `POST` requests to `/v1/responses`. It supports two
+credential sources:
 
-## Expected Usage
+- `--auth stdin` (the default) reads an OpenAI API key from stdin and forwards to
+  `https://api.openai.com/v1/responses`.
+- `--auth chatgpt` loads the managed ChatGPT login and Codex configuration, then forwards to the
+  configured model provider. For the built-in OpenAI provider this resolves to
+  `https://chatgpt.com/backend-api/codex/responses`.
 
-**IMPORTANT:** `codex-responses-api-proxy` is designed to be run by a privileged user with access to `OPENAI_API_KEY` so that an unprivileged user cannot inspect or tamper with the process. Though if `--http-shutdown` is specified, an unprivileged user _can_ make a `GET` request to `/shutdown` to shutdown the server, as an unprivileged user could not send `SIGTERM` to kill the process.
+Everything else is rejected with `403 Forbidden`.
+
+## ChatGPT authentication
+
+ChatGPT mode uses the same configuration and authentication components as `codex app-server`:
+
+- loads `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`);
+- accepts the standard `-c key=value` configuration overrides and `--strict-config`;
+- honors the configured OpenAI provider URL, headers, query parameters, system proxy policy,
+  custom CA handling, and ChatGPT/Cloudflare cookies;
+- refreshes managed OAuth credentials proactively and applies the normal reload/refresh recovery
+  sequence after an upstream `401 Unauthorized`;
+- replaces any inbound `Authorization` header with the managed ChatGPT credentials, including the
+  ChatGPT account and FedRAMP routing headers when applicable.
+
+The listener is always bound to `127.0.0.1`. The port is selected with `--port`; omitting it uses
+an ephemeral port.
+
+## API key authentication
+
+**IMPORTANT:** stdin authentication is designed to be run by a privileged user with access to
+`OPENAI_API_KEY` so that an unprivileged user cannot inspect or tamper with the process. Though if
+`--http-shutdown` is specified, an unprivileged user _can_ make a `GET` request to `/shutdown` to
+shut down the server, as an unprivileged user could not send `SIGTERM` to kill the process.
 
 A privileged user (i.e., `root` or a user with `sudo`) who has access to `OPENAI_API_KEY` would run the following to start the server, as `codex-responses-api-proxy` reads the auth token from `stdin`:
 
@@ -58,10 +101,14 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 
 ## Behavior
 
-- Reads the API key from `stdin`. All callers should pipe the key in (for example, `printenv OPENAI_API_KEY | codex-responses-api-proxy`).
+- With `--auth stdin`, reads the API key from `stdin`. All callers should pipe the key in (for
+  example, `printenv OPENAI_API_KEY | codex-responses-api-proxy`).
+- With `--auth chatgpt`, reads no secret from stdin and uses the managed Codex login.
 - Formats the header value as `Bearer <key>` and attempts to `mlock(2)` the memory holding that header so it is not swapped to disk.
 - Listens on the provided port or an ephemeral port if `--port` is not specified.
-- Accepts exactly `POST /v1/responses` (no query string). The request body is forwarded to `https://api.openai.com/v1/responses` with `Authorization: Bearer <key>` set. All original request headers (except any incoming `Authorization`) are forwarded upstream, with `Host` overridden to `api.openai.com`. For other requests, it responds with `403`.
+- Accepts exactly `POST /v1/responses` (no query string). The request body and headers are forwarded
+  to the selected upstream, except that inbound `Authorization` and `Host` are replaced. For other
+  requests, it responds with `403`.
 - Optionally writes a single-line JSON file with server info, currently `{ "port": <u16>, "pid": <u32> }`.
 - Optionally writes request/response JSON dumps to a directory. Each accepted request gets a pair of files that share a sequence/timestamp prefix, for example `000001-1846179912345-request.json` and `000001-1846179912345-response.json`. Header values are dumped in full except `Authorization` and any header whose name includes `cookie`, which are redacted. Bodies are written as parsed JSON when possible, otherwise as UTF-8 text.
 - Optional `--http-shutdown` enables `GET /shutdown` to terminate the process with exit code `0`. This allows one user (e.g., `root`) to start the proxy and another unprivileged user on the host to shut it down.
@@ -69,15 +116,19 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 ## CLI
 
 ```
-codex-responses-api-proxy [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>]
+codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>]
 ```
 
+- `--auth <stdin|chatgpt>`: Selects stdin API-key auth (default) or the managed Codex ChatGPT login.
+- `-c, --config <key=value>`: Overrides a value otherwise loaded from Codex `config.toml`.
+- `--strict-config`: Fails when `config.toml` contains unknown fields.
 - `--port <PORT>`: Port to bind on `127.0.0.1`. If omitted, an ephemeral port is chosen.
 - `--server-info <FILE>`: If set, the proxy writes a single line of JSON with `{ "port": <PORT>, "pid": <PID> }` once listening.
 - `--http-shutdown`: If set, enables `GET /shutdown` to exit the process with code `0`.
-- `--upstream-url <URL>`: Absolute URL to forward requests to. Defaults to `https://api.openai.com/v1/responses`.
+- `--upstream-url <URL>`: Absolute URL to forward requests to. The default depends on `--auth`.
 - `--dump-dir <DIR>`: If set, writes one request JSON file and one response JSON file per accepted proxy call under this directory. Filenames use a shared sequence/timestamp prefix so each pair is easy to correlate.
-- Authentication is fixed to `Authorization: Bearer <key>` to match the Codex CLI expectations.
+- Authentication is injected by the selected credential source; inbound `Authorization` is never
+  forwarded.
 
 For Azure, for example (ensure your deployment accepts `Authorization: Bearer <key>`):
 

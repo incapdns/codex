@@ -18,15 +18,36 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true, default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+codex-core = { workspace = true }
+codex-http-client = { workspace = true }
+codex-login = { workspace = true }
+codex-model-provider = { workspace = true }
 codex-process-hardening = { workspace = true }
+codex-utils-cli = { workspace = true }
 ctor = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
 libc = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { workspace = true, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "stream",
+] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tiny_http = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+wiremock = { workspace = true }
