@@ -81,6 +81,64 @@ public API's string and easy-message shorthand forms and expands them to equival
 empty input list when those optional public-API fields are omitted. Explicit values and already
 structured item lists are preserved.
 
+## Conversations compatibility
+
+The ChatGPT Codex backend does not expose the public Conversations resource. In ChatGPT auth mode,
+the proxy therefore implements the complete
+[OpenAI Conversations REST contract](https://developers.openai.com/api/reference/resources/conversations)
+locally:
+
+| Operation | Local endpoint |
+| --- | --- |
+| Create conversation | `POST /v1/conversations` |
+| Retrieve conversation | `GET /v1/conversations/{conversation_id}` |
+| Update conversation | `POST /v1/conversations/{conversation_id}` |
+| Delete conversation | `DELETE /v1/conversations/{conversation_id}` |
+| Create items | `POST /v1/conversations/{conversation_id}/items` |
+| List items | `GET /v1/conversations/{conversation_id}/items` |
+| Retrieve item | `GET /v1/conversations/{conversation_id}/items/{item_id}` |
+| Delete item | `DELETE /v1/conversations/{conversation_id}/items/{item_id}` |
+
+Pass a conversation ID to `POST /v1/responses` as either a string or `{ "id": "conv_..." }`.
+The proxy prepends stored context to the upstream request, forces the backend-compatible
+`store: false`, requests encrypted reasoning content for stateless continuation, then adds the new
+input and completed output items to the local conversation. Responses JSON and SSE objects expose
+the public `conversation: { "id": "..." }` field. Concurrent Responses calls for the same local
+conversation are rejected with `409 Conflict` so their histories cannot race.
+
+The default store is `responses_api_proxy_conversations.json` under the configured Codex SQLite
+home and is written with mode `0600` on Unix. Conversation deletion retains its items internally,
+as required by the public contract, while making the deleted conversation inaccessible.
+
+Automatic compaction keeps a separate execution checkpoint without removing items from the
+logical REST history. After 80 new items by default, the proxy tries `POST /responses/compact` for
+the selected model. A successful compacted output becomes the context prefix for later calls; an
+unsupported model/backend transparently continues with uncompacted context. Deleting an item
+invalidates the checkpoint.
+
+Example:
+
+```shell
+CONVERSATION_ID=$(curl -fsS http://127.0.0.1:60001/v1/conversations \
+  -H 'Content-Type: application/json' \
+  -d '{"metadata":{"topic":"demo"}}' | jq -r .id)
+
+curl -N http://127.0.0.1:60001/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"gpt-5.5\",\"conversation\":\"${CONVERSATION_ID}\",\"input\":\"Hello\",\"stream\":true}"
+
+curl -fsS "http://127.0.0.1:60001/v1/conversations/${CONVERSATION_ID}/items?order=asc"
+```
+
+Configuration and equivalent CLI overrides:
+
+```toml
+[responses_api_proxy]
+conversations_compat = true
+conversation_store = "/absolute/path/conversations.json"
+conversation_compact_after_items = 80 # 0 disables automatic compaction
+```
+
 ## Chat Completions compatibility
 
 ChatGPT auth mode exposes `POST /v1/chat/completions` as a compatibility adapter over the
@@ -174,7 +232,7 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 ## CLI
 
 ```
-codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>] [--chat-completions-compat <BOOL>]
+codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>] [--chat-completions-compat <BOOL>] [--conversations-compat <BOOL>] [--conversation-store <FILE>] [--conversation-compact-after-items <COUNT>]
 ```
 
 - `--auth <stdin|chatgpt>`: Selects stdin API-key auth (default) or the managed Codex ChatGPT login.
@@ -188,6 +246,11 @@ codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-co
 - `--dump-dir <DIR>`: If set, writes one request JSON file and one response JSON file per accepted proxy call under this directory. Filenames use a shared sequence/timestamp prefix so each pair is easy to correlate.
 - `--chat-completions-compat <BOOL>`: Overrides the config-file setting for the local
   `POST /v1/chat/completions` adapter in ChatGPT auth mode. Defaults to `true`.
+- `--conversations-compat <BOOL>`: Enables or disables the local Conversations and Conversation
+  Items resources in ChatGPT auth mode. Defaults to `true`.
+- `--conversation-store <FILE>`: Overrides the persistent local Conversations store path.
+- `--conversation-compact-after-items <COUNT>`: Number of new items between opportunistic Compact
+  checkpoints. Defaults to `80`; zero disables automatic compaction.
 - Authentication is injected by the selected credential source; inbound `Authorization` is never
   forwarded.
 
@@ -202,8 +265,11 @@ printenv AZURE_OPENAI_API_KEY | env -u AZURE_OPENAI_API_KEY codex-responses-api-
 
 ## Notes
 
-- Only `POST /v1/responses` is permitted. No query strings are allowed.
-- All request headers are forwarded to the upstream call (aside from overriding `Authorization` and `Host`). Response status and content-type are mirrored from upstream.
+- All request headers for upstream Responses calls are forwarded aside from overriding
+  `Authorization`, `Host`, and hop-by-hop headers. Response status and content-type are mirrored
+  unless local Conversations or Chat Completions adaptation requires body translation.
+- Conversations compatibility is local to ChatGPT auth mode; stdin API-key mode remains a strict
+  upstream Responses proxy.
 
 ## Hardening Details
 

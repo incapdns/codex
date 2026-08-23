@@ -40,6 +40,7 @@ async fn forwards_with_managed_chatgpt_auth_and_replaces_incoming_authorization(
         upstream_headers,
         dump_dir: None,
         chat_completions_compat: true,
+        conversations: None,
         shutdown: CancellationToken::new(),
     };
     let mut incoming_headers = HeaderMap::new();
@@ -208,6 +209,7 @@ async fn forwards_every_supported_responses_operation() {
         upstream_headers: HeaderMap::new(),
         dump_dir: None,
         chat_completions_compat: true,
+        conversations: None,
         shutdown: CancellationToken::new(),
     };
 

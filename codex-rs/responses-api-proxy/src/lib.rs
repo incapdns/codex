@@ -32,6 +32,7 @@ use tiny_http::StatusCode;
 
 mod chat_completions;
 mod chatgpt;
+mod conversations;
 mod dump;
 mod read_api_key;
 mod routes;
@@ -92,6 +93,25 @@ pub struct Args {
     /// Overrides `responses_api_proxy.chat_completions_compat` from config.toml.
     #[arg(long, value_name = "BOOL")]
     pub chat_completions_compat: Option<bool>,
+
+    /// Enable local Conversations and Conversation Items compatibility in ChatGPT auth mode.
+    ///
+    /// Overrides `responses_api_proxy.conversations_compat` from config.toml.
+    #[arg(long, value_name = "BOOL")]
+    pub conversations_compat: Option<bool>,
+
+    /// Persistent file used by the local Conversations compatibility layer.
+    ///
+    /// Overrides `responses_api_proxy.conversation_store` from config.toml.
+    #[arg(long, value_name = "FILE")]
+    pub conversation_store: Option<PathBuf>,
+
+    /// Compact a local conversation checkpoint after this many new items.
+    ///
+    /// Zero disables automatic compaction. Overrides
+    /// `responses_api_proxy.conversation_compact_after_items` from config.toml.
+    #[arg(long, value_name = "COUNT")]
+    pub conversation_compact_after_items: Option<usize>,
 }
 
 #[derive(Serialize)]

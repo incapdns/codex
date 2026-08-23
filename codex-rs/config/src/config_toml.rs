@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::HooksToml;
 use crate::browser_use::BrowserUseConfigToml;
@@ -156,6 +157,17 @@ pub struct ResponsesApiProxyToml {
     /// Expose `POST /v1/chat/completions` by translating it to Responses API calls.
     /// Defaults to `true` in the proxy.
     pub chat_completions_compat: Option<bool>,
+
+    /// Expose the local Conversations and Conversation Items compatibility resources.
+    /// Defaults to `true` in the proxy.
+    pub conversations_compat: Option<bool>,
+
+    /// Persistent JSON store used by the local Conversations compatibility layer.
+    pub conversation_store: Option<PathBuf>,
+
+    /// Compact a conversation checkpoint after this many new items. Zero disables compaction.
+    /// Defaults to 80 items in the proxy.
+    pub conversation_compact_after_items: Option<usize>,
 }
 
 /// Base config deserialized from ~/.codex/config.toml.

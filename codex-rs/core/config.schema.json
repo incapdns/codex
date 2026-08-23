@@ -3218,6 +3218,20 @@
         "chat_completions_compat": {
           "description": "Expose `POST /v1/chat/completions` by translating it to Responses API calls. Defaults to `true` in the proxy.",
           "type": "boolean"
+        },
+        "conversation_compact_after_items": {
+          "description": "Compact a conversation checkpoint after this many new items. Zero disables compaction. Defaults to 80 items in the proxy.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "conversation_store": {
+          "description": "Persistent JSON store used by the local Conversations compatibility layer.",
+          "type": "string"
+        },
+        "conversations_compat": {
+          "description": "Expose the local Conversations and Conversation Items compatibility resources. Defaults to `true` in the proxy.",
+          "type": "boolean"
         }
       },
       "type": "object"

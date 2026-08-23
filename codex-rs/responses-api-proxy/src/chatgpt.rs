@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -27,6 +28,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::Args;
+use crate::conversations::ConversationStore;
 use crate::dump::ExchangeDumper;
 use crate::routes::ResponsesRoute;
 use crate::routes::resolve_responses_route;
@@ -40,6 +42,7 @@ pub(crate) struct ChatgptState {
     pub(crate) upstream_headers: HeaderMap,
     pub(crate) dump_dir: Option<Arc<ExchangeDumper>>,
     pub(crate) chat_completions_compat: bool,
+    pub(crate) conversations: Option<Arc<ConversationStore>>,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -62,15 +65,53 @@ async fn run(args: Args) -> Result<()> {
         .build()
         .await
         .context("loading Codex configuration")?;
+    let effective_config = config.config_layer_stack.effective_config();
+    let proxy_config = effective_config
+        .get("responses_api_proxy")
+        .and_then(toml::Value::as_table);
     let chat_completions_compat = args.chat_completions_compat.unwrap_or_else(|| {
-        config
-            .config_layer_stack
-            .effective_config()
-            .get("responses_api_proxy")
+        proxy_config
             .and_then(|value| value.get("chat_completions_compat"))
             .and_then(toml::Value::as_bool)
             .unwrap_or(true)
     });
+    let conversations_compat = args.conversations_compat.unwrap_or_else(|| {
+        proxy_config
+            .and_then(|value| value.get("conversations_compat"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    });
+    let conversation_store_path = args
+        .conversation_store
+        .clone()
+        .or_else(|| {
+            proxy_config
+                .and_then(|value| value.get("conversation_store"))
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            config
+                .sqlite
+                .home()
+                .join(crate::conversations::DEFAULT_STORE_FILENAME)
+        });
+    let compact_after_items = args.conversation_compact_after_items.unwrap_or_else(|| {
+        proxy_config
+            .and_then(|value| value.get("conversation_compact_after_items"))
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(crate::conversations::DEFAULT_COMPACT_AFTER_ITEMS)
+    });
+    let conversations = if conversations_compat {
+        Some(Arc::new(
+            ConversationStore::load(conversation_store_path, compact_after_items)
+                .await
+                .context("loading local Conversations compatibility store")?,
+        ))
+    } else {
+        None
+    };
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
@@ -119,6 +160,7 @@ async fn run(args: Args) -> Result<()> {
         upstream_headers: provider.headers,
         dump_dir,
         chat_completions_compat,
+        conversations,
         shutdown: shutdown.clone(),
     };
     let router = Router::new().fallback(responses);
@@ -147,6 +189,25 @@ async fn responses(
     let request_uri = uri
         .path_and_query()
         .map_or_else(|| uri.path(), |path_and_query| path_and_query.as_str());
+    if uri.path().starts_with("/v1/conversations") {
+        let Some(conversations) = state.conversations.as_ref() else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        let exchange_dump = state.dump_dir.as_deref().and_then(|dump_dir| {
+            dump_dir
+                .dump_http_request(&method, request_uri, &headers, &body)
+                .map_err(|err| {
+                    eprintln!("responses-api-proxy failed to dump request: {err}");
+                    err
+                })
+                .ok()
+        });
+        let response = conversations
+            .handle(&method, &uri, &body)
+            .await
+            .unwrap_or_else(|| StatusCode::FORBIDDEN.into_response());
+        return tee_local_response(response, exchange_dump);
+    }
     if method == Method::POST && request_uri == "/v1/chat/completions" {
         if !state.chat_completions_compat {
             return StatusCode::FORBIDDEN.into_response();
@@ -166,13 +227,82 @@ async fn responses(
             })
             .ok()
     });
-    match forward_request(&state, &route, headers, body).await {
-        Ok(response) => upstream_response(response, exchange_dump),
+    let mut prepared = if route.is_create() {
+        match state.conversations.as_ref() {
+            Some(conversations) => match conversations.begin_response(&body).await {
+                Ok(prepared) => prepared,
+                Err(err) => return err.into_response(),
+            },
+            None if request_has_conversation(&body) => {
+                return crate::conversations::ConversationError::invalid(
+                    "conversation",
+                    "Local Conversations compatibility is disabled",
+                )
+                .into_response();
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let (Some(conversations), Some(prepared)) = (state.conversations.as_ref(), prepared.as_mut())
+    {
+        conversations
+            .maybe_compact(&state, &headers, prepared)
+            .await;
+    }
+    let upstream_body = match (&state.conversations, prepared.as_ref()) {
+        (Some(conversations), Some(prepared)) => match conversations.upstream_body(prepared) {
+            Ok(body) => body,
+            Err(err) => {
+                conversations.abort_response(prepared).await;
+                return err.into_response();
+            }
+        },
+        _ => body,
+    };
+    match forward_request(&state, &route, headers, upstream_body).await {
+        Ok(response) => match (state.conversations.clone(), prepared) {
+            (Some(conversations), Some(prepared)) => {
+                conversations
+                    .adapt_upstream_response(response, prepared, exchange_dump)
+                    .await
+            }
+            _ => upstream_response(response, exchange_dump),
+        },
         Err(err) => {
+            if let (Some(conversations), Some(prepared)) =
+                (state.conversations.as_ref(), prepared.as_ref())
+            {
+                conversations.abort_response(prepared).await;
+            }
             eprintln!("forwarding error: {err:#}");
             error_response(StatusCode::BAD_GATEWAY, err.to_string())
         }
     }
+}
+
+fn request_has_conversation(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("conversation").cloned())
+        .is_some_and(|value| !value.is_null())
+}
+
+fn tee_local_response(
+    response: Response,
+    exchange_dump: Option<crate::dump::ExchangeDump>,
+) -> Response {
+    let Some(exchange_dump) = exchange_dump else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let stream = exchange_dump.tee_response_stream(
+        parts.status.as_u16(),
+        &parts.headers,
+        body.into_data_stream(),
+    );
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 pub(crate) async fn forward_request(

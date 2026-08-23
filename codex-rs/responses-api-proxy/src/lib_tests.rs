@@ -14,6 +14,11 @@ fn parses_chatgpt_auth_with_standard_config_overrides() {
         "8080",
         "--strict-config",
         "--chat-completions-compat=false",
+        "--conversations-compat=false",
+        "--conversation-store",
+        "/tmp/conversations.json",
+        "--conversation-compact-after-items",
+        "40",
         "-c",
         "openai_base_url=\"https://example.test/backend-api/codex\"",
     ])
@@ -25,6 +30,9 @@ fn parses_chatgpt_auth_with_standard_config_overrides() {
             args.port,
             args.strict_config,
             args.chat_completions_compat,
+            args.conversations_compat,
+            args.conversation_store,
+            args.conversation_compact_after_items,
             args.config_overrides.raw_overrides,
         ),
         (
@@ -32,6 +40,9 @@ fn parses_chatgpt_auth_with_standard_config_overrides() {
             Some(8080),
             true,
             Some(false),
+            Some(false),
+            Some("/tmp/conversations.json".into()),
+            Some(40),
             vec!["openai_base_url=\"https://example.test/backend-api/codex\"".to_string()],
         )
     );
@@ -43,7 +54,14 @@ fn stdin_auth_remains_the_default() {
         Args::try_parse_from(["responses-api-proxy"]).expect("default arguments should parse");
 
     assert_eq!(
-        (args.auth, args.upstream_url, args.chat_completions_compat),
-        (ProxyAuth::Stdin, None, None)
+        (
+            args.auth,
+            args.upstream_url,
+            args.chat_completions_compat,
+            args.conversations_compat,
+            args.conversation_store,
+            args.conversation_compact_after_items,
+        ),
+        (ProxyAuth::Stdin, None, None, None, None, None)
     );
 }
