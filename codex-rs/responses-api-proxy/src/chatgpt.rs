@@ -33,13 +33,14 @@ use crate::routes::resolve_responses_route;
 use crate::write_server_info;
 
 #[derive(Clone)]
-struct ChatgptState {
-    auth_manager: Arc<AuthManager>,
-    client: HttpClient,
-    upstream_url: reqwest::Url,
-    upstream_headers: HeaderMap,
-    dump_dir: Option<Arc<ExchangeDumper>>,
-    shutdown: CancellationToken,
+pub(crate) struct ChatgptState {
+    pub(crate) auth_manager: Arc<AuthManager>,
+    pub(crate) client: HttpClient,
+    pub(crate) upstream_url: reqwest::Url,
+    pub(crate) upstream_headers: HeaderMap,
+    pub(crate) dump_dir: Option<Arc<ExchangeDumper>>,
+    pub(crate) chat_completions_compat: bool,
+    pub(crate) shutdown: CancellationToken,
 }
 
 pub(crate) fn run_main(args: Args) -> Result<()> {
@@ -61,6 +62,15 @@ async fn run(args: Args) -> Result<()> {
         .build()
         .await
         .context("loading Codex configuration")?;
+    let chat_completions_compat = args.chat_completions_compat.unwrap_or_else(|| {
+        config
+            .config_layer_stack
+            .effective_config()
+            .get("responses_api_proxy")
+            .and_then(|value| value.get("chat_completions_compat"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    });
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
@@ -108,6 +118,7 @@ async fn run(args: Args) -> Result<()> {
         upstream_url,
         upstream_headers: provider.headers,
         dump_dir,
+        chat_completions_compat,
         shutdown: shutdown.clone(),
     };
     let router = Router::new().fallback(responses);
@@ -136,6 +147,12 @@ async fn responses(
     let request_uri = uri
         .path_and_query()
         .map_or_else(|| uri.path(), |path_and_query| path_and_query.as_str());
+    if method == Method::POST && request_uri == "/v1/chat/completions" {
+        if !state.chat_completions_compat {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        return crate::chat_completions::handle(state, headers, body).await;
+    }
     let Some(route) = resolve_responses_route(method.as_str(), request_uri) else {
         return StatusCode::FORBIDDEN.into_response();
     };
@@ -158,7 +175,7 @@ async fn responses(
     }
 }
 
-async fn forward_request(
+pub(crate) async fn forward_request(
     state: &ChatgptState,
     route: &ResponsesRoute,
     incoming_headers: HeaderMap,
@@ -308,7 +325,7 @@ fn is_filtered_request_header(name: &HeaderName) -> bool {
     )
 }
 
-fn upstream_response(
+pub(crate) fn upstream_response(
     response: reqwest::Response,
     exchange_dump: Option<crate::dump::ExchangeDump>,
 ) -> Response {
@@ -333,7 +350,7 @@ fn upstream_response(
     downstream
 }
 
-fn is_filtered_response_header(name: &HeaderName) -> bool {
+pub(crate) fn is_filtered_response_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
         "connection" | "content-length" | "trailer" | "transfer-encoding" | "upgrade"

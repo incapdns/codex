@@ -30,6 +30,7 @@ use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
 
+mod chat_completions;
 mod chatgpt;
 mod dump;
 mod read_api_key;
@@ -85,6 +86,12 @@ pub struct Args {
     /// Directory where request/response dumps should be written as JSON.
     #[arg(long, value_name = "DIR")]
     pub dump_dir: Option<PathBuf>,
+
+    /// Enable the local Chat Completions compatibility endpoint in ChatGPT auth mode.
+    ///
+    /// Overrides `responses_api_proxy.chat_completions_compat` from config.toml.
+    #[arg(long, value_name = "BOOL")]
+    pub chat_completions_compat: Option<bool>,
 }
 
 #[derive(Serialize)]

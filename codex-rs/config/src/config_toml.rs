@@ -149,6 +149,15 @@ pub struct OrchestratorFeatureToml {
     pub enabled: Option<bool>,
 }
 
+/// Settings used by the local Responses API proxy.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ResponsesApiProxyToml {
+    /// Expose `POST /v1/chat/completions` by translating it to Responses API calls.
+    /// Defaults to `true` in the proxy.
+    pub chat_completions_compat: Option<bool>,
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -376,6 +385,9 @@ pub struct ConfigToml {
 
     /// Bounded, product-owned metadata attached to every Responses API request.
     pub responses_api_metadata: Option<BTreeMap<String, String>>,
+
+    /// Settings for the local Responses API proxy.
+    pub responses_api_proxy: Option<ResponsesApiProxyToml>,
 
     /// Orchestrator-owned feature settings.
     pub orchestrator: Option<OrchestratorToml>,

@@ -3211,6 +3211,17 @@
         }
       ]
     },
+    "ResponsesApiProxyToml": {
+      "additionalProperties": false,
+      "description": "Settings used by the local Responses API proxy.",
+      "properties": {
+        "chat_completions_compat": {
+          "description": "Expose `POST /v1/chat/completions` by translating it to Responses API calls. Defaults to `true` in the proxy.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "ResumeCwdMode": {
       "description": "Working directory to use when resuming or forking a session.",
       "oneOf": [
@@ -6284,6 +6295,14 @@
       },
       "description": "Bounded, product-owned metadata attached to every Responses API request.",
       "type": "object"
+    },
+    "responses_api_proxy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResponsesApiProxyToml"
+        }
+      ],
+      "description": "Settings for the local Responses API proxy."
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",

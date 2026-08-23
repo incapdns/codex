@@ -10,6 +10,10 @@ codex responses-api-proxy --auth chatgpt --port 60001
 curl http://127.0.0.1:60001/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.1-codex","input":"Hello","stream":true}'
+
+curl http://127.0.0.1:60001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.1-codex","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 The ChatGPT mode loads the normal Codex configuration and credentials. Run `codex login` first;
@@ -77,6 +81,37 @@ public API's string and easy-message shorthand forms and expands them to equival
 empty input list when those optional public-API fields are omitted. Explicit values and already
 structured item lists are preserved.
 
+## Chat Completions compatibility
+
+ChatGPT auth mode exposes `POST /v1/chat/completions` as a compatibility adapter over the
+Responses upstream. It follows the public
+[OpenAI Chat Completions create contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+for the common text, image, function-tool, structured-output, reasoning, streaming, and usage
+fields. Requests are converted to Responses input items; Responses JSON or SSE output is converted
+back to `chat.completion` or `chat.completion.chunk` objects. Non-streaming calls are assembled
+locally from an upstream event stream, so both `stream: false` and `stream: true` are available.
+
+The adapter intentionally rejects parameters whose semantics cannot be preserved instead of
+silently dropping them. It supports one choice per request (`n: 1`). Stored Chat Completions and
+the associated list, retrieve, update, delete, and message-list operations are not exposed: the
+ChatGPT Codex backend requires `store: false`.
+
+Compatibility is enabled by default. Disable it for one invocation with:
+
+```shell
+codex responses-api-proxy --auth chatgpt --chat-completions-compat=false
+```
+
+Or persist the setting in `~/.codex/config.toml`:
+
+```toml
+[responses_api_proxy]
+chat_completions_compat = false
+```
+
+The CLI flag takes precedence over the config file. Standard `-c` overrides work too, for example
+`-c responses_api_proxy.chat_completions_compat=false`.
+
 ## ChatGPT authentication
 
 ChatGPT mode uses the same configuration and authentication components as `codex app-server`:
@@ -139,7 +174,7 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 ## CLI
 
 ```
-codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>]
+codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>] [--chat-completions-compat <BOOL>]
 ```
 
 - `--auth <stdin|chatgpt>`: Selects stdin API-key auth (default) or the managed Codex ChatGPT login.
@@ -151,6 +186,8 @@ codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-co
 - `--upstream-url <URL>`: Absolute create-response URL ending in `/responses`. The default depends
   on `--auth`; resource subpaths and allowed query parameters are derived from this URL.
 - `--dump-dir <DIR>`: If set, writes one request JSON file and one response JSON file per accepted proxy call under this directory. Filenames use a shared sequence/timestamp prefix so each pair is easy to correlate.
+- `--chat-completions-compat <BOOL>`: Overrides the config-file setting for the local
+  `POST /v1/chat/completions` adapter in ChatGPT auth mode. Defaults to `true`.
 - Authentication is injected by the selected credential source; inbound `Authorization` is never
   forwarded.
 

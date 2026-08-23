@@ -4009,6 +4009,7 @@ name = "codex-responses-api-proxy"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "bytes",
  "clap",
@@ -4019,6 +4020,7 @@ dependencies = [
  "codex-process-hardening",
  "codex-utils-cli",
  "ctor 0.6.3",
+ "eventsource-stream",
  "futures",
  "http 1.4.0",
  "libc",
@@ -4029,6 +4031,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tokio-util",
+ "toml 0.9.11+spec-1.1.0",
  "wiremock",
  "zeroize",
 ]
