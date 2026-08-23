@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
@@ -154,6 +155,10 @@ pub struct OrchestratorFeatureToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ResponsesApiProxyToml {
+    /// IP address used by the local Responses API proxy listener.
+    /// Defaults to 127.0.0.1 in the proxy.
+    pub listen_host: Option<IpAddr>,
+
     /// Expose `POST /v1/chat/completions` by translating it to Responses API calls.
     /// Defaults to `true` in the proxy.
     pub chat_completions_compat: Option<bool>,

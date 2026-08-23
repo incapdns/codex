@@ -28,10 +28,12 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::Args;
+use crate::DEFAULT_LISTEN_HOST;
 use crate::conversations::ConversationStore;
 use crate::dump::ExchangeDumper;
 use crate::routes::ResponsesRoute;
 use crate::routes::resolve_responses_route;
+use crate::warn_if_non_loopback;
 use crate::write_server_info;
 
 #[derive(Clone)]
@@ -69,6 +71,18 @@ async fn run(args: Args) -> Result<()> {
     let proxy_config = effective_config
         .get("responses_api_proxy")
         .and_then(toml::Value::as_table);
+    let listen_host = match args.listen_host {
+        Some(listen_host) => listen_host,
+        None => match proxy_config
+            .and_then(|value| value.get("listen_host"))
+            .and_then(toml::Value::as_str)
+        {
+            Some(listen_host) => listen_host.parse().with_context(|| {
+                format!("parsing responses_api_proxy.listen_host `{listen_host}`")
+            })?,
+            None => DEFAULT_LISTEN_HOST,
+        },
+    };
     let chat_completions_compat = args.chat_completions_compat.unwrap_or_else(|| {
         proxy_config
             .and_then(|value| value.get("chat_completions_compat"))
@@ -143,10 +157,10 @@ async fn run(args: Args) -> Result<()> {
         .transpose()
         .context("creating --dump-dir")?
         .map(Arc::new);
-    let listener =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.port.unwrap_or(0)))
-            .await
-            .context("binding ChatGPT Responses API proxy")?;
+    warn_if_non_loopback(listen_host);
+    let listener = tokio::net::TcpListener::bind((listen_host, args.port.unwrap_or(0)))
+        .await
+        .context("binding ChatGPT Responses API proxy")?;
     let bound_addr = listener.local_addr().context("reading proxy address")?;
     if let Some(path) = args.server_info.as_ref() {
         write_server_info(path, bound_addr.port())?;

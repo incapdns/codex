@@ -134,6 +134,7 @@ Configuration and equivalent CLI overrides:
 
 ```toml
 [responses_api_proxy]
+listen_host = "127.0.0.1"
 conversations_compat = true
 conversation_store = "/absolute/path/conversations.json"
 conversation_compact_after_items = 80 # 0 disables automatic compaction
@@ -183,8 +184,15 @@ ChatGPT mode uses the same configuration and authentication components as `codex
 - replaces any inbound `Authorization` header with the managed ChatGPT credentials, including the
   ChatGPT account and FedRAMP routing headers when applicable.
 
-The listener is always bound to `127.0.0.1`. The port is selected with `--port`; omitting it uses
-an ephemeral port.
+The listener binds to `127.0.0.1` by default. Select another IPv4 or IPv6 address with
+`--listen-host`; in ChatGPT auth mode, `responses_api_proxy.listen_host` provides the config-file
+equivalent. The CLI flag takes precedence. The port is selected with `--port`; omitting it uses an
+ephemeral port.
+
+Binding to a non-loopback address exposes an endpoint with no downstream authentication. Any
+reachable client can make requests through the configured upstream credentials. Restrict access
+with host firewall rules or an authenticating reverse proxy; `0.0.0.0` listens on every IPv4
+interface and `::` listens on every IPv6 interface.
 
 ## API key authentication
 
@@ -232,13 +240,15 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 ## CLI
 
 ```
-codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>] [--chat-completions-compat <BOOL>] [--conversations-compat <BOOL>] [--conversation-store <FILE>] [--conversation-compact-after-items <COUNT>]
+codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-config] [--listen-host <IP>] [--port <PORT>] [--server-info <FILE>] [--http-shutdown] [--upstream-url <URL>] [--dump-dir <DIR>] [--chat-completions-compat <BOOL>] [--conversations-compat <BOOL>] [--conversation-store <FILE>] [--conversation-compact-after-items <COUNT>]
 ```
 
 - `--auth <stdin|chatgpt>`: Selects stdin API-key auth (default) or the managed Codex ChatGPT login.
 - `-c, --config <key=value>`: Overrides a value otherwise loaded from Codex `config.toml`.
 - `--strict-config`: Fails when `config.toml` contains unknown fields.
-- `--port <PORT>`: Port to bind on `127.0.0.1`. If omitted, an ephemeral port is chosen.
+- `--listen-host <IP>`: IPv4 or IPv6 socket address to bind. Defaults to `127.0.0.1`; hostnames are
+  rejected. In ChatGPT mode this overrides `responses_api_proxy.listen_host` from `config.toml`.
+- `--port <PORT>`: Port to bind. If omitted, an ephemeral port is chosen.
 - `--server-info <FILE>`: If set, the proxy writes a single line of JSON with `{ "port": <PORT>, "pid": <PID> }` once listening.
 - `--http-shutdown`: If set, enables `GET /shutdown` to exit the process with code `0`.
 - `--upstream-url <URL>`: Absolute create-response URL ending in `/responses`. The default depends

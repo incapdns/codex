@@ -1,5 +1,6 @@
 use clap::Parser;
 use pretty_assertions::assert_eq;
+use std::net::IpAddr;
 
 use super::Args;
 use super::ProxyAuth;
@@ -12,6 +13,8 @@ fn parses_chatgpt_auth_with_standard_config_overrides() {
         "chatgpt",
         "--port",
         "8080",
+        "--listen-host",
+        "0.0.0.0",
         "--strict-config",
         "--chat-completions-compat=false",
         "--conversations-compat=false",
@@ -28,6 +31,7 @@ fn parses_chatgpt_auth_with_standard_config_overrides() {
         (
             args.auth,
             args.port,
+            args.listen_host,
             args.strict_config,
             args.chat_completions_compat,
             args.conversations_compat,
@@ -38,6 +42,7 @@ fn parses_chatgpt_auth_with_standard_config_overrides() {
         (
             ProxyAuth::Chatgpt,
             Some(8080),
+            Some(IpAddr::from([0, 0, 0, 0])),
             true,
             Some(false),
             Some(false),
@@ -57,11 +62,24 @@ fn stdin_auth_remains_the_default() {
         (
             args.auth,
             args.upstream_url,
+            args.listen_host,
             args.chat_completions_compat,
             args.conversations_compat,
             args.conversation_store,
             args.conversation_compact_after_items,
         ),
-        (ProxyAuth::Stdin, None, None, None, None, None)
+        (ProxyAuth::Stdin, None, None, None, None, None, None)
+    );
+}
+
+#[test]
+fn listen_host_requires_an_ip_address() {
+    let ipv6 = Args::try_parse_from(["responses-api-proxy", "--listen-host", "::1"])
+        .expect("IPv6 listen address should parse");
+    assert_eq!(ipv6.listen_host, Some("::1".parse().unwrap()));
+
+    assert!(
+        Args::try_parse_from(["responses-api-proxy", "--listen-host", "localhost"]).is_err(),
+        "hostnames should be rejected so the socket bind address is explicit"
     );
 }

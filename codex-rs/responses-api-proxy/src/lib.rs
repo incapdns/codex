@@ -2,6 +2,8 @@ use std::fs::File;
 use std::fs::{self};
 use std::io::Read;
 use std::io::Write;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::path::Path;
@@ -41,6 +43,8 @@ use read_api_key::read_auth_header_from_stdin;
 use routes::resolve_responses_route;
 use routes::validate_upstream_create_url;
 
+pub(crate) const DEFAULT_LISTEN_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
 /// Credential source used for upstream requests.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
 pub enum ProxyAuth {
@@ -69,6 +73,12 @@ pub struct Args {
     /// Port to listen on. If not set, an ephemeral port is used.
     #[arg(long)]
     pub port: Option<u16>,
+
+    /// IP address to listen on. Defaults to 127.0.0.1.
+    ///
+    /// Overrides `responses_api_proxy.listen_host` from config.toml in ChatGPT auth mode.
+    #[arg(long, value_name = "IP")]
+    pub listen_host: Option<IpAddr>,
 
     /// Path to a JSON file to write startup info (single line). Includes {"port": <u16>}.
     #[arg(long, value_name = "FILE")]
@@ -162,7 +172,8 @@ fn run_api_key_proxy(args: Args) -> Result<()> {
         .context("creating --dump-dir")?
         .map(Arc::new);
 
-    let (listener, bound_addr) = bind_listener(args.port)?;
+    let (listener, bound_addr) =
+        bind_listener(args.listen_host.unwrap_or(DEFAULT_LISTEN_HOST), args.port)?;
     if let Some(path) = args.server_info.as_ref() {
         write_server_info(path, bound_addr.port())?;
     }
@@ -204,11 +215,24 @@ fn run_api_key_proxy(args: Args) -> Result<()> {
     Err(anyhow!("server stopped unexpectedly"))
 }
 
-pub(crate) fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));
+pub(crate) fn bind_listener(
+    listen_host: IpAddr,
+    port: Option<u16>,
+) -> Result<(TcpListener, SocketAddr)> {
+    warn_if_non_loopback(listen_host);
+    let addr = SocketAddr::new(listen_host, port.unwrap_or(0));
     let listener = TcpListener::bind(addr).with_context(|| format!("failed to bind {addr}"))?;
     let bound = listener.local_addr().context("failed to read local_addr")?;
     Ok((listener, bound))
+}
+
+pub(crate) fn warn_if_non_loopback(listen_host: IpAddr) {
+    if !listen_host.is_loopback() {
+        eprintln!(
+            "WARNING: responses-api-proxy is binding to non-loopback address {listen_host}; \
+             reachable clients can use this proxy without downstream authentication"
+        );
+    }
 }
 
 pub(crate) fn write_server_info(path: &Path, port: u16) -> Result<()> {

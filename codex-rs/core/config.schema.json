@@ -3232,6 +3232,11 @@
         "conversations_compat": {
           "description": "Expose the local Conversations and Conversation Items compatibility resources. Defaults to `true` in the proxy.",
           "type": "boolean"
+        },
+        "listen_host": {
+          "description": "IP address used by the local Responses API proxy listener. Defaults to 127.0.0.1 in the proxy.",
+          "format": "ip",
+          "type": "string"
         }
       },
       "type": "object"
