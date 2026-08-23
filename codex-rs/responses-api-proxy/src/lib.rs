@@ -33,8 +33,11 @@ use tiny_http::StatusCode;
 mod chatgpt;
 mod dump;
 mod read_api_key;
+mod routes;
 use dump::ExchangeDumper;
 use read_api_key::read_auth_header_from_stdin;
+use routes::resolve_responses_route;
+use routes::validate_upstream_create_url;
 
 /// Credential source used for upstream requests.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
@@ -112,6 +115,7 @@ fn run_api_key_proxy(args: Args) -> Result<()> {
             .unwrap_or("https://api.openai.com/v1/responses"),
     )
     .context("parsing --upstream-url")?;
+    validate_upstream_create_url(&upstream_url).context("validating --upstream-url")?;
     let host = match (upstream_url.host_str(), upstream_url.port()) {
         (Some(host), Some(port)) => format!("{host}:{port}"),
         (Some(host), None) => host.to_string(),
@@ -209,16 +213,14 @@ fn forward_request(
     dump_dir: Option<&ExchangeDumper>,
     mut req: Request,
 ) -> Result<()> {
-    // Only allow POST /v1/responses exactly, no query string.
     let method = req.method().clone();
     let url_path = req.url().to_string();
-    let allow = method == Method::Post && url_path == "/v1/responses";
-
-    if !allow {
+    let Some(route) = resolve_responses_route(method.as_str(), &url_path) else {
         let resp = Response::new_empty(StatusCode(403));
         let _ = req.respond(resp);
         return Ok(());
-    }
+    };
+    let upstream_url = route.upstream_url(&config.upstream_url)?;
 
     // Read request body
     let mut body = Vec::new();
@@ -241,7 +243,19 @@ fn forward_request(
     for header in req.headers() {
         let name_ascii = header.field.as_str();
         let lower = name_ascii.to_ascii_lowercase();
-        if lower.as_str() == "authorization" || lower.as_str() == "host" {
+        if matches!(
+            lower.as_str(),
+            "authorization"
+                | "connection"
+                | "content-length"
+                | "host"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ) {
             continue;
         }
 
@@ -263,7 +277,7 @@ fn forward_request(
     headers.insert(HOST, config.host_header.clone());
 
     let upstream_resp = client
-        .post(config.upstream_url.clone())
+        .request(route.method, upstream_url)
         .headers(headers)
         .body(body)
         .send()

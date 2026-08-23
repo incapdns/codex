@@ -43,8 +43,7 @@ codex -p proxy
 
 # Detailed docs
 
-A strict HTTP proxy that only forwards `POST` requests to `/v1/responses`. It supports two
-credential sources:
+A strict HTTP proxy for the OpenAI Responses resource. It supports two credential sources:
 
 - `--auth stdin` (the default) reads an OpenAI API key from stdin and forwards to
   `https://api.openai.com/v1/responses`.
@@ -52,7 +51,31 @@ credential sources:
   configured model provider. For the built-in OpenAI provider this resolves to
   `https://chatgpt.com/backend-api/codex/responses`.
 
-Everything else is rejected with `403 Forbidden`.
+## Responses resource
+
+The proxy exposes the complete REST resource documented in the
+[OpenAI Responses API reference](https://developers.openai.com/api/reference/resources/responses):
+
+| Operation | Local endpoint |
+| --- | --- |
+| Create | `POST /v1/responses` |
+| Retrieve | `GET /v1/responses/{response_id}` |
+| Delete | `DELETE /v1/responses/{response_id}` |
+| Cancel | `POST /v1/responses/{response_id}/cancel` |
+| Compact | `POST /v1/responses/compact` |
+| Count input tokens | `POST /v1/responses/input_tokens` |
+| List input items | `GET /v1/responses/{response_id}/input_items` |
+
+Documented query parameters are forwarded for retrieve (`include`, `include_obfuscation`, and
+`starting_after`) and list input items (`after`, `include`, `limit`, and `order`). Request and
+response bodies remain opaque, so streaming and future body fields do not require proxy changes.
+Unsupported methods, paths, and query parameters are rejected with `403 Forbidden`.
+
+The ChatGPT backend requires `input` to be an item list. In ChatGPT mode, the proxy accepts the
+public API's string and easy-message shorthand forms and expands them to equivalent `message` /
+`input_text` items before forwarding. It also supplies the backend-required `store: false` and an
+empty input list when those optional public-API fields are omitted. Explicit values and already
+structured item lists are preserved.
 
 ## ChatGPT authentication
 
@@ -106,9 +129,9 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 - With `--auth chatgpt`, reads no secret from stdin and uses the managed Codex login.
 - Formats the header value as `Bearer <key>` and attempts to `mlock(2)` the memory holding that header so it is not swapped to disk.
 - Listens on the provided port or an ephemeral port if `--port` is not specified.
-- Accepts exactly `POST /v1/responses` (no query string). The request body and headers are forwarded
-  to the selected upstream, except that inbound `Authorization` and `Host` are replaced. For other
-  requests, it responds with `403`.
+- Accepts the Responses resource operations listed above. Request bodies and headers are forwarded
+  to the selected upstream, except that inbound `Authorization`, `Host`, and hop-by-hop headers are
+  replaced or removed. Other requests receive `403`.
 - Optionally writes a single-line JSON file with server info, currently `{ "port": <u16>, "pid": <u32> }`.
 - Optionally writes request/response JSON dumps to a directory. Each accepted request gets a pair of files that share a sequence/timestamp prefix, for example `000001-1846179912345-request.json` and `000001-1846179912345-response.json`. Header values are dumped in full except `Authorization` and any header whose name includes `cookie`, which are redacted. Bodies are written as parsed JSON when possible, otherwise as UTF-8 text.
 - Optional `--http-shutdown` enables `GET /shutdown` to terminate the process with exit code `0`. This allows one user (e.g., `root`) to start the proxy and another unprivileged user on the host to shut it down.
@@ -125,7 +148,8 @@ codex-responses-api-proxy [--auth <stdin|chatgpt>] [-c <key=value>] [--strict-co
 - `--port <PORT>`: Port to bind on `127.0.0.1`. If omitted, an ephemeral port is chosen.
 - `--server-info <FILE>`: If set, the proxy writes a single line of JSON with `{ "port": <PORT>, "pid": <PID> }` once listening.
 - `--http-shutdown`: If set, enables `GET /shutdown` to exit the process with code `0`.
-- `--upstream-url <URL>`: Absolute URL to forward requests to. The default depends on `--auth`.
+- `--upstream-url <URL>`: Absolute create-response URL ending in `/responses`. The default depends
+  on `--auth`; resource subpaths and allowed query parameters are derived from this URL.
 - `--dump-dir <DIR>`: If set, writes one request JSON file and one response JSON file per accepted proxy call under this directory. Filenames use a shared sequence/timestamp prefix so each pair is easy to correlate.
 - Authentication is injected by the selected credential source; inbound `Authorization` is never
   forwarded.

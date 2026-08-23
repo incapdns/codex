@@ -16,7 +16,6 @@ use axum::http::Uri;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
-use axum::routing::post;
 use codex_core::config::ConfigBuilder;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClient;
@@ -29,13 +28,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Args;
 use crate::dump::ExchangeDumper;
+use crate::routes::ResponsesRoute;
+use crate::routes::resolve_responses_route;
 use crate::write_server_info;
 
 #[derive(Clone)]
 struct ChatgptState {
     auth_manager: Arc<AuthManager>,
     client: HttpClient,
-    upstream_url: String,
+    upstream_url: reqwest::Url,
     upstream_headers: HeaderMap,
     dump_dir: Option<Arc<ExchangeDumper>>,
     shutdown: CancellationToken,
@@ -74,11 +75,12 @@ async fn run(args: Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| provider.url_for_path("responses"));
     let upstream_url = reqwest::Url::parse(&upstream_url)
-        .context("parsing --upstream-url or the configured provider URL")?
-        .to_string();
+        .context("parsing --upstream-url or the configured provider URL")?;
+    crate::routes::validate_upstream_create_url(&upstream_url)
+        .context("validating --upstream-url or the configured provider URL")?;
     let client = create_client_for_route_async(
         config.http_client_factory(),
-        upstream_url.clone(),
+        upstream_url.to_string(),
         ClientRouteClass::Api,
     )
     .await
@@ -108,9 +110,7 @@ async fn run(args: Args) -> Result<()> {
         dump_dir,
         shutdown: shutdown.clone(),
     };
-    let router = Router::new()
-        .route("/v1/responses", post(responses))
-        .fallback(forbidden);
+    let router = Router::new().fallback(responses);
     let router = if args.http_shutdown {
         router.route("/shutdown", get(shutdown_server))
     } else {
@@ -128,24 +128,28 @@ async fn run(args: Args) -> Result<()> {
 
 async fn responses(
     State(state): State<ChatgptState>,
+    method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if uri.query().is_some() {
+    let request_uri = uri
+        .path_and_query()
+        .map_or_else(|| uri.path(), |path_and_query| path_and_query.as_str());
+    let Some(route) = resolve_responses_route(method.as_str(), request_uri) else {
         return StatusCode::FORBIDDEN.into_response();
-    }
+    };
 
     let exchange_dump = state.dump_dir.as_deref().and_then(|dump_dir| {
         dump_dir
-            .dump_http_request(&Method::POST, uri.path(), &headers, &body)
+            .dump_http_request(&method, request_uri, &headers, &body)
             .map_err(|err| {
                 eprintln!("responses-api-proxy failed to dump request: {err}");
                 err
             })
             .ok()
     });
-    match forward_request(&state, headers, body).await {
+    match forward_request(&state, &route, headers, body).await {
         Ok(response) => upstream_response(response, exchange_dump),
         Err(err) => {
             eprintln!("forwarding error: {err:#}");
@@ -156,9 +160,14 @@ async fn responses(
 
 async fn forward_request(
     state: &ChatgptState,
+    route: &ResponsesRoute,
     incoming_headers: HeaderMap,
     body: Bytes,
 ) -> Result<reqwest::Response> {
+    let body = normalize_create_body(route, body);
+    let upstream_url = route
+        .upstream_url(&state.upstream_url)
+        .context("constructing the Responses resource URL")?;
     let mut auth_recovery = state.auth_manager.unauthorized_recovery();
     loop {
         let auth = require_chatgpt_auth(state.auth_manager.auth().await)?;
@@ -172,7 +181,7 @@ async fn forward_request(
 
         let response = state
             .client
-            .post(&state.upstream_url)
+            .request(route.method.clone(), upstream_url.clone())
             .headers(headers)
             .body(body.clone())
             .send()
@@ -186,6 +195,81 @@ async fn forward_request(
             return Ok(response);
         }
     }
+}
+
+fn normalize_create_body(route: &ResponsesRoute, body: Bytes) -> Bytes {
+    if !route.is_create() {
+        return body;
+    }
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(payload_object) = payload.as_object_mut() else {
+        return body;
+    };
+
+    let mut changed = false;
+    payload_object.entry("store").or_insert_with(|| {
+        changed = true;
+        serde_json::Value::Bool(false)
+    });
+    let input = payload_object.entry("input").or_insert_with(|| {
+        changed = true;
+        serde_json::Value::Array(Vec::new())
+    });
+    changed |= match input {
+        serde_json::Value::String(_) => {
+            let text = input.take();
+            *input = serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            }]);
+            true
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= normalize_easy_message(item);
+            }
+            changed
+        }
+        serde_json::Value::Null => {
+            *input = serde_json::Value::Array(Vec::new());
+            true
+        }
+        _ => false,
+    };
+
+    if !changed {
+        return body;
+    }
+    serde_json::to_vec(&payload).map_or(body, Bytes::from)
+}
+
+fn normalize_easy_message(item: &mut serde_json::Value) -> bool {
+    let Some(message) = item.as_object_mut() else {
+        return false;
+    };
+    if !message.contains_key("role") {
+        return false;
+    }
+    let Some(serde_json::Value::String(_)) = message.get("content") else {
+        return false;
+    };
+
+    let text = message
+        .get_mut("content")
+        .map(serde_json::Value::take)
+        .unwrap_or(serde_json::Value::Null);
+    message
+        .entry("type")
+        .or_insert_with(|| serde_json::Value::String("message".to_string()));
+    message.insert(
+        "content".to_string(),
+        serde_json::json!([{"type": "input_text", "text": text}]),
+    );
+    true
 }
 
 fn require_chatgpt_auth(auth: Option<CodexAuth>) -> Result<CodexAuth> {
@@ -254,10 +338,6 @@ fn is_filtered_response_header(name: &HeaderName) -> bool {
         name.as_str(),
         "connection" | "content-length" | "trailer" | "transfer-encoding" | "upgrade"
     )
-}
-
-async fn forbidden() -> StatusCode {
-    StatusCode::FORBIDDEN
 }
 
 async fn shutdown_server(State(state): State<ChatgptState>) -> StatusCode {
