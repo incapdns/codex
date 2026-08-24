@@ -203,6 +203,9 @@ async fn responses(
     let request_uri = uri
         .path_and_query()
         .map_or_else(|| uri.path(), |path_and_query| path_and_query.as_str());
+    if let Some(response) = crate::models::handle(&method, uri.path()) {
+        return response;
+    }
     if uri.path().starts_with("/v1/conversations") {
         let Some(conversations) = state.conversations.as_ref() else {
             return StatusCode::FORBIDDEN.into_response();

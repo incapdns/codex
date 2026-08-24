@@ -7,6 +7,8 @@ Use the existing Codex ChatGPT login and expose it as a local Responses API:
 ```shell
 codex responses-api-proxy --auth chatgpt --port 60001
 
+curl -fsS http://127.0.0.1:60001/v1/models | jq
+
 curl http://127.0.0.1:60001/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.1-codex","input":"Hello","stream":true}'
@@ -54,6 +56,29 @@ A strict HTTP proxy for the OpenAI Responses resource. It supports two credentia
 - `--auth chatgpt` loads the managed ChatGPT login and Codex configuration, then forwards to the
   configured model provider. For the built-in OpenAI provider this resolves to
   `https://chatgpt.com/backend-api/codex/responses`.
+
+## Models resource
+
+ChatGPT auth mode exposes the OpenAI-compatible Models read operations locally:
+
+| Operation | Local endpoint |
+| --- | --- |
+| List | `GET /v1/models` |
+| Retrieve | `GET /v1/models/{model}` |
+
+The resource is intentionally restricted to these model IDs:
+
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+- `gpt-daybreak-blue-latest`
+- `gpt-5.5`
+- `gpt-5.4`
+- `gpt-5.4-mini`
+
+Unlisted model IDs return `404 model_not_found`. The Codex model catalog does not expose public
+creation timestamps, so the required `created` field uses Unix epoch `0` as an explicit unknown
+value. Built-in models cannot be deleted through this compatibility resource.
 
 ## Responses resource
 

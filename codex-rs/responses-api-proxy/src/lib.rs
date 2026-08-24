@@ -36,6 +36,7 @@ mod chat_completions;
 mod chatgpt;
 mod conversations;
 mod dump;
+mod models;
 mod read_api_key;
 mod routes;
 use dump::ExchangeDumper;
