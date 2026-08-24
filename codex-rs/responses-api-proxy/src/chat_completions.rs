@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 
@@ -60,10 +61,19 @@ pub(crate) async fn handle(state: ChatgptState, headers: HeaderMap, body: Bytes)
             upstream,
             translated.model,
             translated.include_usage,
+            translated.logprobs_requested,
+            translated.legacy_function_names,
             exchange_dump,
         )
     } else {
-        match collect_completion(upstream, &translated.model).await {
+        match collect_completion(
+            upstream,
+            &translated.model,
+            translated.logprobs_requested,
+            &translated.legacy_function_names,
+        )
+        .await
+        {
             Ok((headers, body)) => buffered_response(headers, body, exchange_dump),
             Err(err) => proxy_error_response(StatusCode::BAD_GATEWAY, err.to_string()),
         }
@@ -76,6 +86,8 @@ struct TranslatedRequest {
     model: String,
     client_stream: bool,
     include_usage: bool,
+    logprobs_requested: bool,
+    legacy_function_names: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -234,14 +246,10 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
         "audio",
         "frequency_penalty",
         "logit_bias",
-        "logprobs",
-        "modalities",
         "prediction",
         "presence_penalty",
         "seed",
         "stop",
-        "top_logprobs",
-        "web_search_options",
     ] {
         if request
             .get(unsupported)
@@ -250,11 +258,21 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
             return Err(CompatError::unsupported(unsupported));
         }
     }
+    translate_modalities(request)?;
 
     let mut input = Vec::new();
     let mut custom_call_ids = HashSet::new();
+    let explicit_call_ids = explicit_tool_call_ids(messages);
+    let mut legacy_calls = HashMap::<String, VecDeque<String>>::new();
     for (index, message) in messages.iter().enumerate() {
-        translate_message(message, index, &mut input, &mut custom_call_ids)?;
+        translate_message(
+            message,
+            index,
+            &mut input,
+            &mut custom_call_ids,
+            &explicit_call_ids,
+            &mut legacy_calls,
+        )?;
     }
 
     let mut responses = Map::new();
@@ -304,6 +322,8 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
     translate_text_config(request, &mut responses)?;
     translate_tools(request, &mut responses)?;
     translate_tool_choice(request, &mut responses)?;
+    let logprobs_requested = translate_logprobs(request, &mut responses)?;
+    let legacy_function_names = legacy_function_names(request);
 
     if let Some(stream_options) = request.get("stream_options").and_then(Value::as_object)
         && let Some(include_obfuscation) = stream_options.get("include_obfuscation")
@@ -322,7 +342,86 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
         model,
         client_stream,
         include_usage,
+        logprobs_requested,
+        legacy_function_names,
     })
+}
+
+fn translate_modalities(request: &Map<String, Value>) -> Result<(), CompatError> {
+    let Some(modalities) = request.get("modalities").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let modalities = modalities
+        .as_array()
+        .ok_or_else(|| CompatError::invalid("modalities", "`modalities` must be an array"))?;
+    if modalities.is_empty() {
+        return Err(CompatError::invalid(
+            "modalities",
+            "`modalities` must contain at least one output modality",
+        ));
+    }
+    for (index, modality) in modalities.iter().enumerate() {
+        match modality.as_str() {
+            Some("text") => {}
+            Some("audio") => {
+                return Err(CompatError::unsupported(format!(
+                    "modalities[{index}]=audio"
+                )));
+            }
+            Some(value) => {
+                return Err(CompatError::invalid(
+                    format!("modalities[{index}]"),
+                    format!("Unsupported output modality `{value}`"),
+                ));
+            }
+            None => {
+                return Err(CompatError::invalid(
+                    format!("modalities[{index}]"),
+                    "Output modalities must be strings",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn translate_logprobs(
+    request: &Map<String, Value>,
+    responses: &mut Map<String, Value>,
+) -> Result<bool, CompatError> {
+    let requested = match request.get("logprobs") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => {
+            return Err(CompatError::invalid(
+                "logprobs",
+                "`logprobs` must be a boolean or null",
+            ));
+        }
+    };
+    let top_logprobs = request.get("top_logprobs").filter(|value| !value.is_null());
+    if top_logprobs.is_some() && !requested {
+        return Err(CompatError::invalid(
+            "top_logprobs",
+            "`logprobs` must be true when `top_logprobs` is set",
+        ));
+    }
+    if let Some(value) = top_logprobs {
+        let value = value.as_u64().filter(|value| *value <= 20).ok_or_else(|| {
+            CompatError::invalid(
+                "top_logprobs",
+                "`top_logprobs` must be an integer between 0 and 20",
+            )
+        })?;
+        responses.insert("top_logprobs".to_string(), Value::from(value));
+    }
+    if requested {
+        responses.insert(
+            "include".to_string(),
+            serde_json::json!(["message.output_text.logprobs"]),
+        );
+    }
+    Ok(requested)
 }
 
 fn optional_bool(request: &Map<String, Value>, field: &str) -> Result<Option<bool>, CompatError> {
@@ -347,11 +446,43 @@ fn copy_if_present(
     }
 }
 
+fn explicit_tool_call_ids(messages: &[Value]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn synthetic_legacy_call_id(
+    message_index: usize,
+    kind: &str,
+    explicit_call_ids: &HashSet<String>,
+) -> String {
+    let base = format!("chatcmpl_legacy_{kind}_{message_index}");
+    if !explicit_call_ids.contains(&base) {
+        return base;
+    }
+    let mut suffix = 1;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if !explicit_call_ids.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 fn translate_message(
     value: &Value,
     index: usize,
     input: &mut Vec<Value>,
     custom_call_ids: &mut HashSet<String>,
+    explicit_call_ids: &HashSet<String>,
+    legacy_calls: &mut HashMap<String, VecDeque<String>>,
 ) -> Result<(), CompatError> {
     let message = value.as_object().ok_or_else(|| {
         CompatError::invalid(
@@ -365,26 +496,8 @@ fn translate_message(
             "Message role must be a string",
         )
     })?;
-    let participant_name = match message.get("name") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(name)) => Some(name.as_str()),
-        Some(_) => {
-            return Err(CompatError::invalid(
-                format!("messages[{index}].name"),
-                "Message `name` must be a string",
-            ));
-        }
-    };
     if message.get("audio").is_some_and(|value| !value.is_null()) {
         return Err(CompatError::unsupported(format!("messages[{index}].audio")));
-    }
-    if message
-        .get("function_call")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(CompatError::unsupported(format!(
-            "messages[{index}].function_call"
-        )));
     }
     for field in message.keys() {
         let supported = match role {
@@ -393,10 +506,11 @@ fn translate_message(
                 "role" | "audio" | "content" | "function_call" | "name" | "refusal" | "tool_calls"
             ),
             "tool" => matches!(field.as_str(), "role" | "content" | "tool_call_id"),
+            "function" => matches!(field.as_str(), "role" | "content" | "name"),
             "developer" | "system" | "user" => {
                 matches!(field.as_str(), "role" | "content" | "name")
             }
-            _ => true,
+            _ => false,
         };
         if !supported {
             return Err(CompatError::invalid(
@@ -404,6 +518,52 @@ fn translate_message(
                 format!("Unknown parameter `messages[{index}].{field}`"),
             ));
         }
+    }
+
+    if role == "function" {
+        if !message.contains_key("content") {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].content"),
+                "Function message `content` is required",
+            ));
+        }
+        let name = message.get("name").and_then(Value::as_str).ok_or_else(|| {
+            CompatError::invalid(
+                format!("messages[{index}].name"),
+                "Function messages require a string `name`",
+            )
+        })?;
+        let output = match message.get("content") {
+            Some(Value::String(content)) => content.clone(),
+            Some(Value::Null) => String::new(),
+            _ => {
+                return Err(CompatError::invalid(
+                    format!("messages[{index}].content"),
+                    "Function message `content` must be a string or null",
+                ));
+            }
+        };
+        let call_id = legacy_calls
+            .get_mut(name)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| synthetic_legacy_call_id(index, "result", explicit_call_ids));
+        if !input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+        }) {
+            input.push(serde_json::json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": "{}",
+            }));
+        }
+        input.push(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }));
+        return Ok(());
     }
 
     if role == "tool" {
@@ -441,6 +601,16 @@ fn translate_message(
             format!("Unsupported message role `{role}`"),
         ));
     }
+    let participant_name = match message.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].name"),
+                "Message `name` must be a string",
+            ));
+        }
+    };
     if role != "assistant" && message.get("content").is_none_or(Value::is_null) {
         return Err(CompatError::invalid(
             format!("messages[{index}].content"),
@@ -448,7 +618,7 @@ fn translate_message(
         ));
     }
     if role == "assistant"
-        && !["content", "tool_calls", "refusal"]
+        && !["content", "function_call", "tool_calls", "refusal"]
             .iter()
             .any(|field| message.get(*field).is_some_and(|value| !value.is_null()))
     {
@@ -483,6 +653,40 @@ fn translate_message(
             "role": role,
             "content": content,
         }));
+    }
+    if message
+        .get("function_call")
+        .is_some_and(|value| !value.is_null())
+        && message
+            .get("tool_calls")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(CompatError::invalid(
+            format!("messages[{index}].function_call"),
+            "Assistant messages cannot contain both `function_call` and `tool_calls`",
+        ));
+    }
+    if let Some(function_call) = message
+        .get("function_call")
+        .filter(|value| !value.is_null())
+    {
+        let path = format!("messages[{index}].function_call");
+        let function_call = function_call
+            .as_object()
+            .ok_or_else(|| CompatError::invalid(&path, "`function_call` must be an object"))?;
+        let name = required_string(function_call, "name", &path)?;
+        let arguments = required_string(function_call, "arguments", &path)?;
+        let call_id = synthetic_legacy_call_id(index, "call", explicit_call_ids);
+        input.push(serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }));
+        legacy_calls
+            .entry(name.to_string())
+            .or_default()
+            .push_back(call_id);
     }
     if let Some(tool_calls) = message.get("tool_calls") {
         if role != "assistant" {
@@ -599,6 +803,14 @@ fn translate_message_content(
                         copy_prompt_cache_breakpoint(object, &mut translated);
                         Ok(translated)
                     }
+                    Some("input_audio") => {
+                        if role != "user" {
+                            return Err(CompatError::unsupported(format!(
+                                "messages[{message_index}].content[{part_index}]"
+                            )));
+                        }
+                        translate_audio_content(object, message_index, part_index)
+                    }
                     Some("file") => {
                         if role != "user" {
                             return Err(CompatError::unsupported(format!(
@@ -634,6 +846,48 @@ fn translate_message_content(
             "Message content must be a string, array, or null",
         )),
     }
+}
+
+fn translate_audio_content(
+    part: &Map<String, Value>,
+    message_index: usize,
+    part_index: usize,
+) -> Result<Value, CompatError> {
+    let path = format!("messages[{message_index}].content[{part_index}]");
+    let audio = part
+        .get("input_audio")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CompatError::invalid(
+                format!("{path}.input_audio"),
+                "Audio content requires an `input_audio` object",
+            )
+        })?;
+    for field in audio.keys() {
+        if !matches!(field.as_str(), "data" | "format") {
+            return Err(CompatError::invalid(
+                format!("{path}.input_audio.{field}"),
+                format!("Unknown parameter `{path}.input_audio.{field}`"),
+            ));
+        }
+    }
+    let data = required_string(audio, "data", &format!("{path}.input_audio"))?;
+    let mime = match required_string(audio, "format", &format!("{path}.input_audio"))? {
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        format => {
+            return Err(CompatError::invalid(
+                format!("{path}.input_audio.format"),
+                format!("Unsupported input audio format `{format}`"),
+            ));
+        }
+    };
+    let mut translated = serde_json::json!({
+        "type": "input_audio",
+        "audio_url": format!("data:{mime};base64,{data}"),
+    });
+    copy_prompt_cache_breakpoint(part, &mut translated);
+    Ok(translated)
 }
 
 fn translate_file_content(
@@ -826,36 +1080,131 @@ fn translate_tools(
     request: &Map<String, Value>,
     responses: &mut Map<String, Value>,
 ) -> Result<(), CompatError> {
-    let mut tools = Vec::new();
+    let mut translated = Vec::new();
     if let Some(value) = request.get("tools") {
-        tools.extend(
-            value
-                .as_array()
-                .ok_or_else(|| CompatError::invalid("tools", "`tools` must be an array"))?
-                .iter()
-                .cloned(),
-        );
+        let tools = value
+            .as_array()
+            .ok_or_else(|| CompatError::invalid("tools", "`tools` must be an array"))?;
+        for (index, tool) in tools.iter().enumerate() {
+            translated.push(translate_tool_definition(tool, &format!("tools[{index}]"))?);
+        }
     }
     if let Some(value) = request.get("functions") {
-        tools.extend(
-            value
-                .as_array()
-                .ok_or_else(|| CompatError::invalid("functions", "`functions` must be an array"))?
-                .iter()
-                .map(|function| serde_json::json!({"type": "function", "function": function})),
-        );
+        let functions = value
+            .as_array()
+            .ok_or_else(|| CompatError::invalid("functions", "`functions` must be an array"))?;
+        for (index, function) in functions.iter().enumerate() {
+            translated.push(translate_tool_definition(
+                &serde_json::json!({"type": "function", "function": function}),
+                &format!("functions[{index}]"),
+            )?);
+        }
     }
-    if !request.contains_key("tools") && !request.contains_key("functions") {
-        return Ok(());
+    if let Some(options) = request
+        .get("web_search_options")
+        .filter(|value| !value.is_null())
+    {
+        translated.push(translate_web_search_options(options)?);
     }
-
-    let translated = tools
-        .iter()
-        .enumerate()
-        .map(|(index, tool)| translate_tool_definition(tool, &format!("tools[{index}]")))
-        .collect::<Result<Vec<_>, _>>()?;
-    responses.insert("tools".to_string(), Value::Array(translated));
+    if request.contains_key("tools")
+        || request.contains_key("functions")
+        || request
+            .get("web_search_options")
+            .is_some_and(|value| !value.is_null())
+    {
+        responses.insert("tools".to_string(), Value::Array(translated));
+    }
     Ok(())
+}
+
+fn translate_web_search_options(value: &Value) -> Result<Value, CompatError> {
+    let options = value.as_object().ok_or_else(|| {
+        CompatError::invalid(
+            "web_search_options",
+            "`web_search_options` must be an object",
+        )
+    })?;
+    for field in options.keys() {
+        if !matches!(field.as_str(), "search_context_size" | "user_location") {
+            return Err(CompatError::invalid(
+                format!("web_search_options.{field}"),
+                format!("Unknown parameter `web_search_options.{field}`"),
+            ));
+        }
+    }
+    let mut translated =
+        Map::from_iter([("type".to_string(), Value::String("web_search".to_string()))]);
+    if let Some(size) = options
+        .get("search_context_size")
+        .filter(|value| !value.is_null())
+    {
+        match size.as_str() {
+            Some("low" | "medium" | "high") => {
+                translated.insert("search_context_size".to_string(), size.clone());
+            }
+            _ => {
+                return Err(CompatError::invalid(
+                    "web_search_options.search_context_size",
+                    "`search_context_size` must be `low`, `medium`, or `high`",
+                ));
+            }
+        }
+    }
+    if let Some(location) = options
+        .get("user_location")
+        .filter(|value| !value.is_null())
+    {
+        let location = location.as_object().ok_or_else(|| {
+            CompatError::invalid(
+                "web_search_options.user_location",
+                "`user_location` must be an object or null",
+            )
+        })?;
+        for field in location.keys() {
+            if !matches!(field.as_str(), "approximate" | "type") {
+                return Err(CompatError::invalid(
+                    format!("web_search_options.user_location.{field}"),
+                    format!("Unknown parameter `web_search_options.user_location.{field}`"),
+                ));
+            }
+        }
+        if location.get("type").and_then(Value::as_str) != Some("approximate") {
+            return Err(CompatError::invalid(
+                "web_search_options.user_location.type",
+                "`user_location.type` must be `approximate`",
+            ));
+        }
+        let approximate = location
+            .get("approximate")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                CompatError::invalid(
+                    "web_search_options.user_location.approximate",
+                    "`user_location.approximate` must be an object",
+                )
+            })?;
+        let mut output_location =
+            Map::from_iter([("type".to_string(), Value::String("approximate".to_string()))]);
+        for (field, value) in approximate {
+            if !matches!(field.as_str(), "city" | "country" | "region" | "timezone") {
+                return Err(CompatError::invalid(
+                    format!("web_search_options.user_location.approximate.{field}"),
+                    format!(
+                        "Unknown parameter `web_search_options.user_location.approximate.{field}`"
+                    ),
+                ));
+            }
+            if !value.is_string() {
+                return Err(CompatError::invalid(
+                    format!("web_search_options.user_location.approximate.{field}"),
+                    format!("`{field}` must be a string"),
+                ));
+            }
+            output_location.insert(field.clone(), value.clone());
+        }
+        translated.insert("user_location".to_string(), Value::Object(output_location));
+    }
+    Ok(Value::Object(translated))
 }
 
 fn translate_tool_definition(tool: &Value, path: &str) -> Result<Value, CompatError> {
@@ -873,6 +1222,7 @@ fn translate_tool_definition(tool: &Value, path: &str) -> Result<Value, CompatEr
                         "Function tools require `function`",
                     )
                 })?;
+            required_string(function, "name", &format!("{path}.function"))?;
             let mut output = function.clone();
             output.insert("type".to_string(), Value::String("function".to_string()));
             Ok(Value::Object(output))
@@ -908,6 +1258,36 @@ fn translate_tool_definition(tool: &Value, path: &str) -> Result<Value, CompatEr
             "Tools require `type`",
         )),
     }
+}
+
+fn legacy_function_names(request: &Map<String, Value>) -> HashSet<String> {
+    let mut legacy = request
+        .get("functions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|function| function.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    if let Some(name) = request
+        .get("function_call")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("name"))
+        .and_then(Value::as_str)
+    {
+        legacy.insert(name.to_string());
+    }
+    let modern = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| tool.get("function"))
+        .filter_map(|function| function.get("name").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    legacy.retain(|name| !modern.contains(name.as_str()));
+    legacy
 }
 
 fn translate_tool_choice(
@@ -1037,12 +1417,19 @@ fn streaming_response(
     upstream: reqwest::Response,
     request_model: String,
     include_usage: bool,
+    logprobs_requested: bool,
+    legacy_function_names: HashSet<String>,
     exchange_dump: Option<ExchangeDump>,
 ) -> Response {
     let headers = translated_headers(upstream.headers(), "text/event-stream");
     let mut events = Box::pin(upstream.bytes_stream().eventsource());
     let stream = async_stream::try_stream! {
-        let mut translator = StreamTranslator::new(request_model, include_usage);
+        let mut translator = StreamTranslator::new(
+            request_model,
+            include_usage,
+            logprobs_requested,
+            legacy_function_names,
+        );
         while let Some(event) = events.next().await {
             let event = event.map_err(|err| io::Error::other(err.to_string()))?;
             if event.data == "[DONE]" {
@@ -1088,6 +1475,8 @@ fn stream_response(
 async fn collect_completion(
     upstream: reqwest::Response,
     request_model: &str,
+    logprobs_requested: bool,
+    legacy_function_names: &HashSet<String>,
 ) -> Result<(HeaderMap, Bytes), CompatError> {
     let headers = translated_headers(upstream.headers(), "application/json");
     let mut events = Box::pin(upstream.bytes_stream().eventsource());
@@ -1131,7 +1520,12 @@ async fn collect_completion(
             "Responses stream ended without a terminal response",
         )
     })?;
-    let completion = completion_from_response(&response, request_model);
+    let completion = completion_from_response(
+        &response,
+        request_model,
+        logprobs_requested,
+        legacy_function_names,
+    );
     let body = serde_json::to_vec(&completion)
         .map(Bytes::from)
         .map_err(|err| CompatError::invalid("upstream", err.to_string()))?;
@@ -1149,6 +1543,12 @@ fn buffered_response(
     stream_response(StatusCode::OK, headers, stream, exchange_dump)
 }
 
+#[derive(Clone, Copy)]
+enum StreamCall {
+    Tool(usize),
+    LegacyFunction,
+}
+
 struct StreamTranslator {
     id: String,
     created: i64,
@@ -1157,14 +1557,22 @@ struct StreamTranslator {
     system_fingerprint: Option<Value>,
     obfuscation: Option<String>,
     role_sent: bool,
-    tool_calls: HashMap<u64, usize>,
+    calls: HashMap<u64, StreamCall>,
     next_tool_index: usize,
     include_usage: bool,
+    logprobs_requested: bool,
+    legacy_function_names: HashSet<String>,
+    has_legacy_function_call: bool,
     done: bool,
 }
 
 impl StreamTranslator {
-    fn new(model: String, include_usage: bool) -> Self {
+    fn new(
+        model: String,
+        include_usage: bool,
+        logprobs_requested: bool,
+        legacy_function_names: HashSet<String>,
+    ) -> Self {
         Self {
             id: "chatcmpl-pending".to_string(),
             created: unix_timestamp(),
@@ -1173,9 +1581,12 @@ impl StreamTranslator {
             system_fingerprint: None,
             obfuscation: None,
             role_sent: false,
-            tool_calls: HashMap::new(),
+            calls: HashMap::new(),
             next_tool_index: 0,
             include_usage,
+            logprobs_requested,
+            legacy_function_names,
+            has_legacy_function_call: false,
             done: false,
         }
     }
@@ -1196,7 +1607,7 @@ impl StreamTranslator {
             Some("response.output_text.delta") => {
                 self.push_role(&mut frames);
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    frames.push(self.chunk(serde_json::json!({"content": delta}), None));
+                    frames.push(self.text_chunk(delta, event.get("logprobs")));
                 }
             }
             Some("response.refusal.delta") => {
@@ -1214,15 +1625,29 @@ impl StreamTranslator {
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(self.next_tool_index as u64);
-                    let tool_index = self.next_tool_index;
-                    self.next_tool_index += 1;
-                    self.tool_calls.insert(output_index, tool_index);
                     let call_id = item
                         .get("call_id")
                         .or_else(|| item.get("id"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    if item_type == Some("function_call")
+                        && self.legacy_function_names.contains(name)
+                    {
+                        self.calls.insert(output_index, StreamCall::LegacyFunction);
+                        self.has_legacy_function_call = true;
+                        frames.push(self.chunk(
+                            serde_json::json!({
+                                "function_call": {"name": name, "arguments": ""}
+                            }),
+                            None,
+                        ));
+                        return frames;
+                    }
+                    let tool_index = self.next_tool_index;
+                    self.next_tool_index += 1;
+                    self.calls
+                        .insert(output_index, StreamCall::Tool(tool_index));
                     let delta = if item_type == Some("custom_tool_call") {
                         serde_json::json!({
                             "tool_calls": [{
@@ -1251,17 +1676,28 @@ impl StreamTranslator {
                     .get("output_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                let tool_index = self.tool_calls.get(&output_index).copied().unwrap_or(0);
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    frames.push(self.chunk(
-                        serde_json::json!({
-                            "tool_calls": [{
-                                "index": tool_index,
-                                "function": {"arguments": delta},
-                            }]
-                        }),
-                        None,
-                    ));
+                    match self.calls.get(&output_index).copied() {
+                        Some(StreamCall::LegacyFunction) => frames.push(self.chunk(
+                            serde_json::json!({"function_call": {"arguments": delta}}),
+                            None,
+                        )),
+                        _ => {
+                            let tool_index = match self.calls.get(&output_index).copied() {
+                                Some(StreamCall::Tool(index)) => index,
+                                _ => 0,
+                            };
+                            frames.push(self.chunk(
+                                serde_json::json!({
+                                    "tool_calls": [{
+                                        "index": tool_index,
+                                        "function": {"arguments": delta},
+                                    }]
+                                }),
+                                None,
+                            ));
+                        }
+                    }
                 }
             }
             Some("response.custom_tool_call_input.delta") => {
@@ -1270,7 +1706,10 @@ impl StreamTranslator {
                     .get("output_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                let tool_index = self.tool_calls.get(&output_index).copied().unwrap_or(0);
+                let tool_index = match self.calls.get(&output_index).copied() {
+                    Some(StreamCall::Tool(index)) => index,
+                    _ => 0,
+                };
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     frames.push(self.chunk(
                         serde_json::json!({
@@ -1287,7 +1726,13 @@ impl StreamTranslator {
                 let response = event.get("response").unwrap_or(&Value::Null);
                 self.update_metadata(response);
                 self.push_role(&mut frames);
-                let finish_reason = finish_reason(response, !self.tool_calls.is_empty());
+                let finish_reason = if self.next_tool_index > 0 {
+                    "tool_calls"
+                } else if self.has_legacy_function_call {
+                    "function_call"
+                } else {
+                    finish_reason(response, false)
+                };
                 frames.push(self.terminal_chunk(response, finish_reason));
                 if self.include_usage {
                     frames.push(self.usage_chunk(response.get("usage")));
@@ -1358,6 +1803,14 @@ impl StreamTranslator {
         sse_json(&self.chunk_value(delta, finish_reason))
     }
 
+    fn text_chunk(&self, delta: &str, logprobs: Option<&Value>) -> Bytes {
+        let mut chunk = self.chunk_value(serde_json::json!({"content": delta}), None);
+        if self.logprobs_requested {
+            chunk["choices"][0]["logprobs"] = chat_choice_logprobs(logprobs);
+        }
+        sse_json(&chunk)
+    }
+
     fn chunk_value(&self, delta: Value, finish_reason: Option<&str>) -> Value {
         let mut chunk = serde_json::json!({
             "id": self.id,
@@ -1402,10 +1855,18 @@ impl StreamTranslator {
     }
 }
 
-fn completion_from_response(response: &Value, request_model: &str) -> Value {
+fn completion_from_response(
+    response: &Value,
+    request_model: &str,
+    logprobs_requested: bool,
+    legacy_function_names: &HashSet<String>,
+) -> Value {
     let mut content = String::new();
     let mut refusal = String::new();
+    let mut annotations = Vec::new();
+    let mut output_logprobs = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut legacy_function_call = None;
     if let Some(output) = response.get("output").and_then(Value::as_array) {
         for item in output {
             match item.get("type").and_then(Value::as_str) {
@@ -1414,8 +1875,28 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
                         for part in parts {
                             match part.get("type").and_then(Value::as_str) {
                                 Some("output_text") => {
+                                    let content_offset = content.chars().count();
                                     if let Some(text) = part.get("text").and_then(Value::as_str) {
                                         content.push_str(text);
+                                    }
+                                    if let Some(part_annotations) =
+                                        part.get("annotations").and_then(Value::as_array)
+                                    {
+                                        annotations.extend(part_annotations.iter().filter_map(
+                                            |annotation| {
+                                                chat_annotation_with_offset(
+                                                    annotation,
+                                                    content_offset,
+                                                )
+                                            },
+                                        ));
+                                    }
+                                    if logprobs_requested
+                                        && let Some(logprobs) =
+                                            part.get("logprobs").and_then(Value::as_array)
+                                    {
+                                        output_logprobs
+                                            .extend(logprobs.iter().filter_map(chat_token_logprob));
                                     }
                                 }
                                 Some("refusal") => {
@@ -1430,14 +1911,23 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
                     }
                 }
                 Some("function_call") => {
-                    tool_calls.push(serde_json::json!({
-                        "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or(""),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
-                            "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or(""),
-                        },
-                    }));
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                    if legacy_function_call.is_none() && legacy_function_names.contains(name) {
+                        legacy_function_call = Some(serde_json::json!({
+                            "name": name,
+                            "arguments": arguments,
+                        }));
+                    } else {
+                        tool_calls.push(serde_json::json!({
+                            "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or(""),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        }));
+                    }
                 }
                 Some("custom_tool_call") => {
                     tool_calls.push(serde_json::json!({
@@ -1457,7 +1947,9 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
     message.insert("role".to_string(), Value::String("assistant".to_string()));
     message.insert(
         "content".to_string(),
-        if content.is_empty() && (!tool_calls.is_empty() || !refusal.is_empty()) {
+        if content.is_empty()
+            && (!tool_calls.is_empty() || legacy_function_call.is_some() || !refusal.is_empty())
+        {
             Value::Null
         } else {
             Value::String(content)
@@ -1465,6 +1957,12 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
     );
     if !refusal.is_empty() {
         message.insert("refusal".to_string(), Value::String(refusal));
+    }
+    if !annotations.is_empty() {
+        message.insert("annotations".to_string(), Value::Array(annotations));
+    }
+    if let Some(function_call) = legacy_function_call.as_ref() {
+        message.insert("function_call".to_string(), function_call.clone());
     }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".to_string(), Value::Array(tool_calls.clone()));
@@ -1481,17 +1979,98 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
         "choices": [{
             "index": 0,
             "message": Value::Object(message),
-            "logprobs": null,
-            "finish_reason": finish_reason(response, !tool_calls.is_empty()),
+            "logprobs": if logprobs_requested {
+                Value::Object(Map::from_iter([
+                    ("content".to_string(), Value::Array(output_logprobs)),
+                    ("refusal".to_string(), Value::Null),
+                ]))
+            } else {
+                Value::Null
+            },
+            "finish_reason": if !tool_calls.is_empty() {
+                "tool_calls"
+            } else if legacy_function_call.is_some() {
+                "function_call"
+            } else {
+                finish_reason(response, false)
+            },
         }],
         "usage": chat_usage(response.get("usage")),
     });
-    for field in ["moderation", "service_tier", "system_fingerprint"] {
+    for field in [
+        "metadata",
+        "moderation",
+        "service_tier",
+        "system_fingerprint",
+    ] {
         if let Some(value) = response.get(field).filter(|value| !value.is_null()) {
             completion[field] = value.clone();
         }
     }
     completion
+}
+
+fn chat_annotation_with_offset(annotation: &Value, offset: usize) -> Option<Value> {
+    if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+        return None;
+    }
+    let start = annotation.get("start_index")?.as_u64()? + offset as u64;
+    let end = annotation.get("end_index")?.as_u64()? + offset as u64;
+    Some(serde_json::json!({
+        "type": "url_citation",
+        "url_citation": {
+            "start_index": start,
+            "end_index": end,
+            "title": annotation.get("title")?.as_str()?,
+            "url": annotation.get("url")?.as_str()?,
+        }
+    }))
+}
+
+fn chat_choice_logprobs(logprobs: Option<&Value>) -> Value {
+    let content = logprobs
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(chat_token_logprob)
+        .collect::<Vec<_>>();
+    serde_json::json!({"content": content, "refusal": null})
+}
+
+fn chat_token_logprob(logprob: &Value) -> Option<Value> {
+    let token = logprob.get("token")?.as_str()?;
+    let probability = logprob.get("logprob")?.as_f64()?;
+    let bytes = logprob
+        .get("bytes")
+        .filter(|value| value.is_array() || value.is_null())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(token.as_bytes()));
+    let top_logprobs = logprob
+        .get("top_logprobs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|top| {
+            let token = top.get("token")?.as_str()?;
+            let probability = top.get("logprob")?.as_f64()?;
+            let bytes = top
+                .get("bytes")
+                .filter(|value| value.is_array() || value.is_null())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(token.as_bytes()));
+            Some(serde_json::json!({
+                "token": token,
+                "bytes": bytes,
+                "logprob": probability,
+            }))
+        })
+        .collect::<Vec<_>>();
+    Some(serde_json::json!({
+        "token": token,
+        "bytes": bytes,
+        "logprob": probability,
+        "top_logprobs": top_logprobs,
+    }))
 }
 
 fn finish_reason(response: &Value, has_tool_calls: bool) -> &'static str {

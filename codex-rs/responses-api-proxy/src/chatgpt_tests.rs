@@ -127,6 +127,15 @@ fn normalizes_easy_message_content_but_preserves_structured_input() {
         })
     );
 
+    let assistant = Bytes::from_static(
+        br#"{"input":[{"role":"assistant","content":"prior answer"}],"model":"gpt-test"}"#,
+    );
+    let normalized = super::normalize_create_body(&route, assistant);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&normalized).unwrap()["input"][0]["content"],
+        serde_json::json!([{"type": "output_text", "text": "prior answer"}])
+    );
+
     let structured = Bytes::from_static(
         br#"{"model":"gpt-test","store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#,
     );

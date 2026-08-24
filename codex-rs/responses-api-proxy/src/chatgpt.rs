@@ -454,9 +454,14 @@ pub(crate) fn normalize_public_response_input_item(item: &mut Value) -> bool {
             .and_then(Value::as_str)
             .map(str::to_string)
         {
+            let content_type = if item.get("role").and_then(Value::as_str) == Some("assistant") {
+                "output_text"
+            } else {
+                "input_text"
+            };
             item.insert(
                 "content".to_string(),
-                serde_json::json!([{"type": "input_text", "text": text}]),
+                serde_json::json!([{"type": content_type, "text": text}]),
             );
             changed = true;
         }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::body::Bytes;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -148,6 +150,41 @@ fn translates_chat_file_parts_to_responses_input_files() {
 }
 
 #[test]
+fn translates_chat_audio_parts_to_responses_audio_urls() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "UklGRg==", "format": "wav"}
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "SUQz", "format": "mp3"},
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }
+            ]
+        }]
+    });
+
+    let translated = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&translated.body).unwrap();
+    assert_eq!(
+        body["input"][0]["content"],
+        serde_json::json!([
+            {"type": "input_audio", "audio_url": "data:audio/wav;base64,UklGRg=="},
+            {
+                "type": "input_audio",
+                "audio_url": "data:audio/mpeg;base64,SUQz",
+                "prompt_cache_breakpoint": {"mode": "explicit"}
+            }
+        ])
+    );
+}
+
+#[test]
 fn preserves_chat_participant_names_in_message_content() {
     let request = serde_json::json!({
         "model": "gpt-test",
@@ -199,6 +236,141 @@ fn rejects_non_string_chat_participant_names() {
 
     let error = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap_err();
     assert_eq!(error.param.as_deref(), Some("messages[0].name"));
+}
+
+#[test]
+fn translates_text_modality_logprobs_and_web_search() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": "Find the source"}],
+        "modalities": ["text"],
+        "logprobs": true,
+        "top_logprobs": 5,
+        "tools": [{
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}}
+        }],
+        "web_search_options": {
+            "search_context_size": "high",
+            "user_location": {
+                "type": "approximate",
+                "approximate": {
+                    "city": "Sao Paulo",
+                    "country": "BR",
+                    "timezone": "America/Sao_Paulo"
+                }
+            }
+        }
+    });
+
+    let translated = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&translated.body).unwrap();
+    assert_eq!(
+        body["include"],
+        serde_json::json!(["message.output_text.logprobs"])
+    );
+    assert_eq!(body["top_logprobs"], 5);
+    assert!(body.get("modalities").is_none());
+    assert_eq!(
+        body["tools"],
+        serde_json::json!([
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object"}
+            },
+            {
+                "type": "web_search",
+                "search_context_size": "high",
+                "user_location": {
+                    "type": "approximate",
+                    "city": "Sao Paulo",
+                    "country": "BR",
+                    "timezone": "America/Sao_Paulo"
+                }
+            }
+        ])
+    );
+}
+
+#[test]
+fn validates_modalities_and_logprob_dependencies() {
+    let text_only = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [],
+        "modalities": ["text"],
+        "logprobs": false
+    });
+    assert!(translate_request(&serde_json::to_vec(&text_only).unwrap()).is_ok());
+
+    let audio = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [],
+        "modalities": ["text", "audio"]
+    });
+    let error = translate_request(&serde_json::to_vec(&audio).unwrap()).unwrap_err();
+    assert_eq!(error.param.as_deref(), Some("modalities[1]=audio"));
+
+    let singleton = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [],
+        "modalities": "text"
+    });
+    let error = translate_request(&serde_json::to_vec(&singleton).unwrap()).unwrap_err();
+    assert_eq!(error.param.as_deref(), Some("modalities"));
+
+    let missing_logprobs = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [],
+        "top_logprobs": 3
+    });
+    let error = translate_request(&serde_json::to_vec(&missing_logprobs).unwrap()).unwrap_err();
+    assert_eq!(error.param.as_deref(), Some("top_logprobs"));
+}
+
+#[test]
+fn translates_deprecated_function_messages_and_calls() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [
+            {"role": "assistant", "function_call": {
+                "name": "lookup",
+                "arguments": "{\"id\":1}"
+            }},
+            {"role": "function", "name": "lookup", "content": "found"},
+            {"role": "function", "name": "orphan", "content": null}
+        ]
+    });
+
+    let translated = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&translated.body).unwrap();
+    assert_eq!(
+        body["input"],
+        serde_json::json!([
+            {
+                "type": "function_call",
+                "call_id": "chatcmpl_legacy_call_0",
+                "name": "lookup",
+                "arguments": "{\"id\":1}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "chatcmpl_legacy_call_0",
+                "output": "found"
+            },
+            {
+                "type": "function_call",
+                "call_id": "chatcmpl_legacy_result_2",
+                "name": "orphan",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "chatcmpl_legacy_result_2",
+                "output": ""
+            }
+        ])
+    );
 }
 
 #[test]
@@ -414,6 +586,7 @@ fn converts_terminal_response_to_chat_completion() {
         "created_at": 123,
         "model": "gpt-test-2026-08-23",
         "status": "completed",
+        "metadata": {"trace": "abc"},
         "moderation": {"input": {"flagged": false}, "output": {"flagged": false}},
         "output": [
             {"type": "message", "role": "assistant", "content": [
@@ -433,12 +606,13 @@ fn converts_terminal_response_to_chat_completion() {
     });
 
     assert_eq!(
-        completion_from_response(&response, "requested-model"),
+        completion_from_response(&response, "requested-model", false, &HashSet::new()),
         serde_json::json!({
             "id": "chatcmpl-abc",
             "object": "chat.completion",
             "created": 123,
             "model": "gpt-test-2026-08-23",
+            "metadata": {"trace": "abc"},
             "moderation": {"input": {"flagged": false}, "output": {"flagged": false}},
             "choices": [{
                 "index": 0,
@@ -470,8 +644,201 @@ fn converts_terminal_response_to_chat_completion() {
 }
 
 #[test]
+fn preserves_response_logprobs_citations_and_legacy_function_calls() {
+    let response = serde_json::json!({
+        "id": "resp_legacy",
+        "created_at": 123,
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [
+            {"type": "message", "role": "assistant", "content": [
+                {
+                    "type": "output_text",
+                    "text": "Hi ",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 0,
+                        "end_index": 2,
+                        "title": "First",
+                        "url": "https://example.com/first"
+                    }],
+                    "logprobs": [{
+                        "token": "Hi",
+                        "logprob": -0.1,
+                        "top_logprobs": [{"token": "Hey", "logprob": -0.2}]
+                    }]
+                },
+                {
+                    "type": "output_text",
+                    "text": "there",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 0,
+                        "end_index": 5,
+                        "title": "Second",
+                        "url": "https://example.com/second"
+                    }],
+                    "logprobs": [{
+                        "token": "there",
+                        "bytes": [116, 104, 101, 114, 101],
+                        "logprob": -0.3,
+                        "top_logprobs": []
+                    }]
+                }
+            ]},
+            {
+                "type": "function_call",
+                "call_id": "call_lookup",
+                "name": "lookup",
+                "arguments": "{\"id\":1}"
+            }
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+    });
+    let legacy_names = HashSet::from(["lookup".to_string()]);
+
+    let completion = completion_from_response(&response, "requested-model", true, &legacy_names);
+    assert_eq!(completion["choices"][0]["message"]["content"], "Hi there");
+    assert_eq!(
+        completion["choices"][0]["message"]["function_call"],
+        serde_json::json!({"name": "lookup", "arguments": "{\"id\":1}"})
+    );
+    assert_eq!(completion["choices"][0]["finish_reason"], "function_call");
+    assert_eq!(
+        completion["choices"][0]["message"]["annotations"],
+        serde_json::json!([
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "start_index": 0,
+                    "end_index": 2,
+                    "title": "First",
+                    "url": "https://example.com/first"
+                }
+            },
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "start_index": 3,
+                    "end_index": 8,
+                    "title": "Second",
+                    "url": "https://example.com/second"
+                }
+            }
+        ])
+    );
+    assert_eq!(
+        completion["choices"][0]["logprobs"],
+        serde_json::json!({
+            "content": [
+                {
+                    "token": "Hi",
+                    "bytes": [72, 105],
+                    "logprob": -0.1,
+                    "top_logprobs": [{
+                        "token": "Hey",
+                        "bytes": [72, 101, 121],
+                        "logprob": -0.2
+                    }]
+                },
+                {
+                    "token": "there",
+                    "bytes": [116, 104, 101, 114, 101],
+                    "logprob": -0.3,
+                    "top_logprobs": []
+                }
+            ],
+            "refusal": null
+        })
+    );
+}
+
+#[test]
+fn translates_streamed_logprobs_and_legacy_functions_without_invalid_annotations() {
+    let mut translator = StreamTranslator::new(
+        "requested-model".to_string(),
+        false,
+        true,
+        HashSet::from(["lookup".to_string()]),
+    );
+    let events = [
+        serde_json::json!({
+            "type": "response.created",
+            "response": {"id": "resp_stream", "created_at": 456, "model": "gpt-test"}
+        }),
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "Hi",
+            "logprobs": [{
+                "token": "Hi",
+                "logprob": -0.1,
+                "top_logprobs": [{"token": "Hey", "logprob": -0.2}]
+            }]
+        }),
+        serde_json::json!({
+            "type": "response.output_text.annotation.added",
+            "annotation": {
+                "type": "url_citation",
+                "start_index": 0,
+                "end_index": 2,
+                "title": "Source",
+                "url": "https://example.com"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_legacy",
+                "name": "lookup"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "delta": "{}"
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_stream", "status": "completed", "output": []}
+        }),
+    ];
+    let frames = events
+        .iter()
+        .flat_map(|event| translator.translate_event(event))
+        .collect::<Vec<_>>();
+    let chunks = frames[..frames.len() - 1]
+        .iter()
+        .map(parse_sse_json)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        chunks[1]["choices"][0]["logprobs"]["content"][0]["bytes"],
+        serde_json::json!([72, 105])
+    );
+    assert!(
+        chunks.iter().all(
+            |chunk| chunk["choices"].as_array().is_none_or(|choices| choices
+                .iter()
+                .all(|choice| choice["delta"].get("annotations").is_none()))
+        )
+    );
+    assert_eq!(
+        chunks[2]["choices"][0]["delta"]["function_call"],
+        serde_json::json!({"name": "lookup", "arguments": ""})
+    );
+    assert_eq!(
+        chunks[3]["choices"][0]["delta"]["function_call"],
+        serde_json::json!({"arguments": "{}"})
+    );
+    assert_eq!(chunks[4]["choices"][0]["finish_reason"], "function_call");
+}
+
+#[test]
 fn translates_custom_tool_stream_events_to_chat_chunks() {
-    let mut translator = StreamTranslator::new("requested-model".to_string(), false);
+    let mut translator =
+        StreamTranslator::new("requested-model".to_string(), false, false, HashSet::new());
     let events = [
         serde_json::json!({
             "type": "response.created",
@@ -523,7 +890,8 @@ fn translates_custom_tool_stream_events_to_chat_chunks() {
 
 #[test]
 fn translates_responses_events_to_chat_completion_chunks() {
-    let mut translator = StreamTranslator::new("requested-model".to_string(), true);
+    let mut translator =
+        StreamTranslator::new("requested-model".to_string(), true, false, HashSet::new());
     let events = [
         serde_json::json!({
             "type": "response.created",
