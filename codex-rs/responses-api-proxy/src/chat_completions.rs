@@ -410,6 +410,14 @@ fn translate_message_content(
                         }
                         Ok(translated)
                     }
+                    Some("file") => {
+                        if role == "assistant" {
+                            return Err(CompatError::unsupported(format!(
+                                "messages[{message_index}].content[{part_index}]"
+                            )));
+                        }
+                        translate_file_content(object, message_index, part_index)
+                    }
                     Some(kind) => Err(CompatError::unsupported(format!(
                         "messages[{message_index}].content[{part_index}].type={kind}"
                     ))),
@@ -425,6 +433,47 @@ fn translate_message_content(
             "Message content must be a string, array, or null",
         )),
     }
+}
+
+fn translate_file_content(
+    part: &Map<String, Value>,
+    message_index: usize,
+    part_index: usize,
+) -> Result<Value, CompatError> {
+    let path = format!("messages[{message_index}].content[{part_index}]");
+    let file = part.get("file").and_then(Value::as_object).ok_or_else(|| {
+        CompatError::invalid(
+            format!("{path}.file"),
+            "File content requires a `file` object",
+        )
+    })?;
+    let mut translated =
+        Map::from_iter([("type".to_string(), Value::String("input_file".to_string()))]);
+    for field in ["file_data", "file_id", "filename"] {
+        let Some(value) = file.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if !value.is_string() {
+            return Err(CompatError::invalid(
+                format!("{path}.file.{field}"),
+                format!("`{field}` must be a string"),
+            ));
+        }
+        translated.insert(field.to_string(), value.clone());
+    }
+    if !translated.contains_key("file_id") && !translated.contains_key("file_data") {
+        return Err(CompatError::invalid(
+            format!("{path}.file"),
+            "File content requires `file_id` or `file_data`",
+        ));
+    }
+    if let Some(breakpoint) = part
+        .get("prompt_cache_breakpoint")
+        .filter(|value| !value.is_null())
+    {
+        translated.insert("prompt_cache_breakpoint".to_string(), breakpoint.clone());
+    }
+    Ok(Value::Object(translated))
 }
 
 fn text_content(role: &str, text: &str) -> Value {

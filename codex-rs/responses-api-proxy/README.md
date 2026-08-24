@@ -197,7 +197,7 @@ conversation_compact_after_items = 80 # 0 disables automatic compaction
 ChatGPT auth mode exposes `POST /v1/chat/completions` as a compatibility adapter over the
 Responses upstream. It follows the public
 [OpenAI Chat Completions create contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
-for the common text, image, function-tool, structured-output, reasoning, streaming, and usage
+for the common text, image, file, function-tool, structured-output, reasoning, streaming, and usage
 fields. Requests are converted to Responses input items; Responses JSON or SSE output is converted
 back to `chat.completion` or `chat.completion.chunk` objects. Non-streaming calls are assembled
 locally from an upstream event stream, so both `stream: false` and `stream: true` are available.

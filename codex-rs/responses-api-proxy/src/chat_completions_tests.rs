@@ -81,6 +81,59 @@ fn translates_chat_messages_tools_and_public_shorthand() {
 }
 
 #[test]
+fn translates_chat_file_parts_to_responses_input_files() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "file",
+                    "file": {"file_id": "file_abc"}
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0x",
+                        "filename": "reference.pdf"
+                    },
+                    "prompt_cache_breakpoint": {"type": "ephemeral"}
+                }
+            ]
+        }]
+    });
+
+    let translated = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&translated.body).unwrap();
+    assert_eq!(
+        body["input"][0]["content"],
+        serde_json::json!([
+            {"type": "input_file", "file_id": "file_abc"},
+            {
+                "type": "input_file",
+                "file_data": "data:application/pdf;base64,JVBERi0x",
+                "filename": "reference.pdf",
+                "prompt_cache_breakpoint": {"type": "ephemeral"}
+            }
+        ])
+    );
+}
+
+#[test]
+fn rejects_malformed_chat_file_parts_with_a_precise_parameter() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "file", "file": {"filename": "empty.pdf"}}]
+        }]
+    });
+
+    let error = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap_err();
+    assert_eq!(error.param.as_deref(), Some("messages[0].content[0].file"));
+}
+
+#[test]
 fn rejects_backend_incompatible_storage_and_multiple_choices() {
     let store = serde_json::json!({
         "model": "gpt-test",
