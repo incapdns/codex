@@ -203,7 +203,7 @@ async fn responses(
     let request_uri = uri
         .path_and_query()
         .map_or_else(|| uri.path(), |path_and_query| path_and_query.as_str());
-    if let Some(response) = crate::models::handle(&method, uri.path()) {
+    if let Some(response) = crate::models::handle(&state, &method, uri.path(), &headers).await {
         return response;
     }
     if uri.path().starts_with("/v1/conversations") {
@@ -332,6 +332,23 @@ pub(crate) async fn forward_request(
     let upstream_url = route
         .upstream_url(&state.upstream_url)
         .context("constructing the Responses resource URL")?;
+    authenticated_request(
+        state,
+        route.method.clone(),
+        upstream_url,
+        incoming_headers,
+        body,
+    )
+    .await
+}
+
+pub(crate) async fn authenticated_request(
+    state: &ChatgptState,
+    method: Method,
+    upstream_url: reqwest::Url,
+    incoming_headers: HeaderMap,
+    body: Bytes,
+) -> Result<reqwest::Response> {
     let mut auth_recovery = state.auth_manager.unauthorized_recovery();
     loop {
         let auth = require_chatgpt_auth(state.auth_manager.auth().await)?;
@@ -345,12 +362,12 @@ pub(crate) async fn forward_request(
 
         let response = state
             .client
-            .request(route.method.clone(), upstream_url.clone())
+            .request(method.clone(), upstream_url.clone())
             .headers(headers)
             .body(body.clone())
             .send()
             .await
-            .context("forwarding request to the Codex backend")?;
+            .context("sending authenticated request to the Codex backend")?;
         if response.status() != StatusCode::UNAUTHORIZED || !auth_recovery.has_next() {
             return Ok(response);
         }

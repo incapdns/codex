@@ -66,7 +66,9 @@ ChatGPT auth mode exposes the OpenAI-compatible Models read operations locally:
 | List | `GET /v1/models` |
 | Retrieve | `GET /v1/models/{model}` |
 
-The resource is intentionally restricted to these model IDs:
+The resource fetches the current catalog from the configured Codex provider and exposes entries
+where `visibility` is `list` and `supported_in_api` is `true`. At the time of writing, the remote
+catalog selects these model IDs:
 
 - `gpt-5.6-sol`
 - `gpt-5.6-terra`
@@ -76,9 +78,11 @@ The resource is intentionally restricted to these model IDs:
 - `gpt-5.4`
 - `gpt-5.4-mini`
 
-Unlisted model IDs return `404 model_not_found`. The Codex model catalog does not expose public
-creation timestamps, so the required `created` field uses Unix epoch `0` as an explicit unknown
-value. Built-in models cannot be deleted through this compatibility resource.
+The compact decoder reads only `slug`, `visibility`, and `supported_in_api`; model instructions and
+all other backend-only metadata are ignored and are never exposed. Models that do not pass the
+dynamic filter return `404 model_not_found`. The Codex model catalog does not expose public creation
+timestamps, so the required `created` field uses Unix epoch `0` as an explicit unknown value.
+Built-in models cannot be deleted through this compatibility resource.
 
 ## Responses resource
 
