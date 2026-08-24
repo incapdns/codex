@@ -148,6 +148,60 @@ fn translates_chat_file_parts_to_responses_input_files() {
 }
 
 #[test]
+fn preserves_chat_participant_names_in_message_content() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [
+            {"role": "developer", "name": "policy", "content": "Follow policy"},
+            {"role": "system", "name": "router", "content": "Route requests"},
+            {"role": "user", "name": "Alice\nAdmin", "content": [
+                {"type": "text", "text": "Hello"}
+            ]},
+            {"role": "assistant", "name": "worker", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}
+        ]
+    });
+
+    let translated = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&translated.body).unwrap();
+    assert_eq!(
+        body["input"],
+        serde_json::json!([
+            {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "[participant name=\"policy\"]\n"},
+                {"type": "input_text", "text": "Follow policy"}
+            ]},
+            {"type": "message", "role": "system", "content": [
+                {"type": "input_text", "text": "[participant name=\"router\"]\n"},
+                {"type": "input_text", "text": "Route requests"}
+            ]},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "[participant name=\"Alice\\nAdmin\"]\n"},
+                {"type": "input_text", "text": "Hello"}
+            ]},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "[participant name=\"worker\"]\n"}
+            ]},
+            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
+        ])
+    );
+}
+
+#[test]
+fn rejects_non_string_chat_participant_names() {
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "name": ["Alice"], "content": "Hello"}]
+    });
+
+    let error = translate_request(&serde_json::to_vec(&request).unwrap()).unwrap_err();
+    assert_eq!(error.param.as_deref(), Some("messages[0].name"));
+}
+
+#[test]
 fn translates_custom_tools_calls_outputs_and_choices() {
     let request = serde_json::json!({
         "model": "gpt-test",

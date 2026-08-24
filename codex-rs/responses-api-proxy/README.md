@@ -208,6 +208,10 @@ converted to Responses input items; Responses JSON or SSE output is converted ba
 `chat.completion` or `chat.completion.chunk` objects. Non-streaming calls are assembled locally from
 an upstream event stream, so both `stream: false` and `stream: true` are available.
 
+Chat participant names are preserved in-band as a leading text content part such as
+`[participant name="Alice"]`, because Responses messages have no `name` property. The original role
+and remaining content parts keep their order and types.
+
 The adapter intentionally rejects parameters whose semantics cannot be preserved instead of
 silently dropping them. It supports one choice per request (`n: 1`). Stored Chat Completions and
 the associated list, retrieve, update, delete, and message-list operations are not exposed: the

@@ -365,9 +365,16 @@ fn translate_message(
             "Message role must be a string",
         )
     })?;
-    if message.get("name").is_some_and(|value| !value.is_null()) {
-        return Err(CompatError::unsupported(format!("messages[{index}].name")));
-    }
+    let participant_name = match message.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        Some(_) => {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].name"),
+                "Message `name` must be a string",
+            ));
+        }
+    };
     if message.get("audio").is_some_and(|value| !value.is_null()) {
         return Err(CompatError::unsupported(format!("messages[{index}].audio")));
     }
@@ -452,6 +459,9 @@ fn translate_message(
     }
 
     let mut content = translate_message_content(message.get("content"), role, index)?;
+    if let Some(name) = participant_name {
+        content.insert(0, participant_name_content(role, name));
+    }
     if let Some(refusal) = message.get("refusal").filter(|value| !value.is_null()) {
         if role != "assistant" {
             return Err(CompatError::invalid(
@@ -677,6 +687,14 @@ fn text_content(role: &str, text: &str, source: Option<&Map<String, Value>>) -> 
         copy_prompt_cache_breakpoint(source, &mut translated);
     }
     translated
+}
+
+fn participant_name_content(role: &str, name: &str) -> Value {
+    // Responses messages have no `name` field. Keep Chat's participant identity model-visible
+    // without passing an unsupported property to the upstream API. JSON quoting makes the marker
+    // unambiguous even when a name contains whitespace, quotes, or line breaks.
+    let quoted_name = Value::String(name.to_string()).to_string();
+    text_content(role, &format!("[participant name={quoted_name}]\n"), None)
 }
 
 fn copy_prompt_cache_breakpoint(source: &Map<String, Value>, destination: &mut Value) {
