@@ -2,6 +2,7 @@ use anyhow::Result;
 use anyhow::bail;
 use http::Method;
 use reqwest::Url;
+use std::collections::HashSet;
 
 const RESPONSES_PATH: &str = "/v1/responses";
 
@@ -135,12 +136,45 @@ fn valid_query(query: Option<&str>, allowed: &[&str]) -> bool {
         return false;
     }
 
-    Url::parse(&format!("http://localhost/?{query}"))
-        .ok()
-        .is_some_and(|url| {
-            url.query_pairs()
-                .all(|(name, _)| allowed.contains(&name.as_ref()))
-        })
+    let Ok(url) = Url::parse(&format!("http://localhost/?{query}")) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    url.query_pairs().all(|(name, value)| {
+        if !allowed.contains(&name.as_ref()) {
+            return false;
+        }
+        match name.as_ref() {
+            "include" | "include[]" => valid_include(&value),
+            "include_obfuscation" => {
+                seen.insert("include_obfuscation") && matches!(value.as_ref(), "true" | "false")
+            }
+            "starting_after" => seen.insert("starting_after") && value.parse::<u64>().is_ok(),
+            "after" => seen.insert("after") && !value.is_empty(),
+            "limit" => {
+                seen.insert("limit")
+                    && value
+                        .parse::<usize>()
+                        .is_ok_and(|limit| (1..=100).contains(&limit))
+            }
+            "order" => seen.insert("order") && matches!(value.as_ref(), "asc" | "desc"),
+            _ => false,
+        }
+    })
+}
+
+fn valid_include(value: &str) -> bool {
+    matches!(
+        value,
+        "web_search_call.action.sources"
+            | "web_search_call.results"
+            | "code_interpreter_call.outputs"
+            | "computer_call_output.output.image_url"
+            | "file_search_call.results"
+            | "message.input_image.image_url"
+            | "message.output_text.logprobs"
+            | "reasoning.encrypted_content"
+    )
 }
 
 #[cfg(test)]

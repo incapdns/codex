@@ -184,21 +184,21 @@ async fn prepends_history_and_persists_response_items() {
 }
 
 #[tokio::test]
-async fn normalizes_single_conversation_items_and_replayed_output_annotations() {
+async fn preserves_public_arrays_and_canonicalizes_documented_string_unions() {
     let directory = TempDir::new().unwrap();
     let store = ConversationStore::new_for_testing(directory.path().join("store.json"), 80).await;
     let conversation = store
         .create_conversation(
             br#"{
-                "items": {
+                "items": [{
                     "type": "message",
                     "role": "assistant",
-                    "content": {
+                    "content": [{
                         "type": "output_text",
                         "text": "previous",
-                        "annotations": {"type": "file_citation", "file_id": "file_1"}
-                    }
-                }
+                        "annotations": [{"type": "file_citation", "file_id": "file_1"}]
+                    }]
+                }]
             }"#,
         )
         .await
@@ -222,12 +222,12 @@ async fn normalizes_single_conversation_items_and_replayed_output_annotations() 
     let request = serde_json::json!({
         "model": "gpt-test",
         "conversation": conversation_id,
-        "include": "file_search_call.results",
-        "input": {
+        "include": ["file_search_call.results"],
+        "input": [{
             "type": "message",
             "role": "user",
-            "content": {"type": "input_text", "text": "next"}
-        }
+            "content": "next"
+        }]
     });
     let prepared = store
         .begin_response(&serde_json::to_vec(&request).unwrap())
@@ -241,6 +241,41 @@ async fn normalizes_single_conversation_items_and_replayed_output_annotations() 
     assert_eq!(
         upstream["include"],
         serde_json::json!(["file_search_call.results", "reasoning.encrypted_content"])
+    );
+}
+
+#[tokio::test]
+async fn rejects_singletons_for_conversation_item_arrays_and_response_input() {
+    let directory = TempDir::new().unwrap();
+    let store = ConversationStore::new_for_testing(directory.path().join("store.json"), 80).await;
+    assert!(
+        store
+            .create_conversation(br#"{"items":{"role":"user","content":"hello"}}"#)
+            .await
+            .is_err()
+    );
+
+    let conversation = store.create_conversation(br#"{}"#).await.unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+    assert!(
+        store
+            .create_items(
+                conversation_id,
+                br#"{"items":{"role":"user","content":"hello"}}"#,
+            )
+            .await
+            .is_err()
+    );
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "conversation": conversation_id,
+        "input": {"role": "user", "content": "hello"}
+    });
+    assert!(
+        store
+            .begin_response(&serde_json::to_vec(&request).unwrap())
+            .await
+            .is_err()
     );
 }
 
@@ -416,6 +451,29 @@ fn route_parser_accepts_the_complete_official_resource() {
         assert!(
             super::resolve_route(&method, &uri).is_ok(),
             "{method} {uri}"
+        );
+    }
+}
+
+#[test]
+fn route_parser_rejects_noncanonical_paths_and_queries() {
+    let cases = [
+        ("POST", "/v1/conversations/"),
+        ("GET", "/v1/conversations/conv_1/"),
+        ("GET", "/v1/conversations/conv_1//items"),
+        ("GET", "/v1/conversations/conv_1/items?"),
+        ("GET", "/v1/conversations/conv_1/items?limit=1&limit=2"),
+        ("GET", "/v1/conversations/conv_1/items?order=asc&order=desc"),
+        ("GET", "/v1/conversations/conv_1/items?after="),
+        ("GET", "/v1/conversations/conv_1/items?include=unknown"),
+        ("POST", "/v1/conversations/conv_1/items?include=unknown"),
+    ];
+    for (method, uri) in cases {
+        let method = http::Method::from_bytes(method.as_bytes()).unwrap();
+        let uri = uri.parse().unwrap();
+        assert!(
+            super::resolve_route(&method, &uri).is_err(),
+            "accepted {method} {uri}"
         );
     }
 }

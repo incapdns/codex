@@ -9,8 +9,8 @@ fn accepts_the_complete_responses_resource_contract() {
         ("POST", "/v1/responses", "/backend-api/codex/responses"),
         (
             "GET",
-            "/v1/responses/resp_123?include=reasoning.encrypted_content&include_obfuscation=false&starting_after=7",
-            "/backend-api/codex/responses/resp_123?tenant=codex&include=reasoning.encrypted_content&include_obfuscation=false&starting_after=7",
+            "/v1/responses/resp_123?include=reasoning.encrypted_content&include[]=web_search_call.results&include_obfuscation=false&starting_after=7",
+            "/backend-api/codex/responses/resp_123?tenant=codex&include=reasoning.encrypted_content&include[]=web_search_call.results&include_obfuscation=false&starting_after=7",
         ),
         (
             "DELETE",
@@ -64,6 +64,17 @@ fn rejects_unsupported_methods_paths_and_queries() {
         ("POST", "/v1/responses?stream=true"),
         ("GET", "/v1/responses/resp_123?unknown=true"),
         ("GET", "/v1/responses/resp_123/input_items?before=item_1"),
+        ("GET", "/v1/responses/resp_123?include=unknown"),
+        ("GET", "/v1/responses/resp_123?include_obfuscation=yes"),
+        ("GET", "/v1/responses/resp_123?starting_after=-1"),
+        (
+            "GET",
+            "/v1/responses/resp_123?starting_after=1&starting_after=2",
+        ),
+        ("GET", "/v1/responses/resp_123/input_items?after="),
+        ("GET", "/v1/responses/resp_123/input_items?limit=0"),
+        ("GET", "/v1/responses/resp_123/input_items?limit=1&limit=2"),
+        ("GET", "/v1/responses/resp_123/input_items?order=newest"),
         ("GET", "/v1/responses/resp_123/unknown"),
         ("GET", "/v1/responses/../input_items"),
         ("POST", "/v1/responses/resp_123//cancel"),

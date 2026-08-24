@@ -205,7 +205,7 @@ async fn responses(
     let request_uri = uri
         .path_and_query()
         .map_or_else(|| uri.path(), |path_and_query| path_and_query.as_str());
-    if let Some(response) = crate::models::handle(&state, &method, uri.path(), &headers).await {
+    if let Some(response) = crate::models::handle(&state, &method, request_uri, &headers).await {
         return response;
     }
     if uri.path().starts_with("/v1/conversations") {
@@ -236,6 +236,9 @@ async fn responses(
     let Some(route) = resolve_responses_route(method.as_str(), request_uri) else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    if let Err(error) = validate_response_request_collections(&route, &body) {
+        return error.into_response();
+    }
 
     let exchange_dump = state.dump_dir.as_deref().and_then(|dump_dir| {
         dump_dir
@@ -398,25 +401,14 @@ fn normalize_create_body(route: &ResponsesRoute, body: Bytes) -> Bytes {
             Value::Bool(false)
         });
     }
-    changed |= normalize_array_field(payload_object, "context_management");
-    changed |= normalize_array_field(payload_object, "include");
-    changed |= normalize_tools_field(payload_object, "tools");
-    if let Some(tool_choice) = payload_object
-        .get_mut("tool_choice")
-        .and_then(Value::as_object_mut)
-        && tool_choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
-    {
-        changed |= normalize_array_field(tool_choice, "tools");
-    }
-
     if route.is_create() {
         let input = payload_object.entry("input").or_insert_with(|| {
             changed = true;
             Value::Array(Vec::new())
         });
-        changed |= normalize_response_input_collections(input);
+        changed |= normalize_public_response_input(input);
     } else if let Some(input) = payload_object.get_mut("input") {
-        changed |= normalize_response_input_collections(input);
+        changed |= normalize_public_response_input(input);
     }
 
     if !changed {
@@ -425,7 +417,7 @@ fn normalize_create_body(route: &ResponsesRoute, body: Bytes) -> Bytes {
     serde_json::to_vec(&payload).map_or(body, Bytes::from)
 }
 
-fn normalize_response_input_collections(input: &mut Value) -> bool {
+fn normalize_public_response_input(input: &mut Value) -> bool {
     let mut changed = match input {
         Value::String(_) => {
             let text = input.take();
@@ -437,22 +429,519 @@ fn normalize_response_input_collections(input: &mut Value) -> bool {
             true
         }
         Value::Array(_) => false,
-        Value::Null => {
-            *input = Value::Array(Vec::new());
-            true
-        }
-        _ => {
-            let item = input.take();
-            *input = Value::Array(vec![item]);
-            true
-        }
+        _ => false,
     };
     if let Value::Array(items) = input {
         for item in items {
-            changed |= normalize_response_item_collections(item);
+            changed |= normalize_public_response_input_item(item);
         }
     }
     changed
+}
+
+pub(crate) fn normalize_public_response_input_item(item: &mut Value) -> bool {
+    let Some(item) = item.as_object_mut() else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) == Some("message") || item.contains_key("role") {
+        let mut changed = false;
+        if !item.contains_key("type") {
+            item.insert("type".to_string(), Value::String("message".to_string()));
+            changed = true;
+        }
+        if let Some(text) = item
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            item.insert(
+                "content".to_string(),
+                serde_json::json!([{"type": "input_text", "text": text}]),
+            );
+            changed = true;
+        }
+        if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+            for part in content {
+                changed |= default_input_image_detail(part);
+            }
+        }
+        return changed;
+    }
+    if matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    ) && let Some(output) = item.get_mut("output").and_then(Value::as_array_mut)
+    {
+        let mut changed = false;
+        for part in output {
+            changed |= default_input_image_detail(part);
+        }
+        return changed;
+    }
+    false
+}
+
+fn default_input_image_detail(part: &mut Value) -> bool {
+    let Some(part) = part.as_object_mut() else {
+        return false;
+    };
+    if part.get("type").and_then(Value::as_str) == Some("input_image")
+        && part.get("detail").is_none_or(Value::is_null)
+    {
+        part.insert("detail".to_string(), Value::String("auto".to_string()));
+        return true;
+    }
+    false
+}
+
+fn validate_response_request_collections(
+    route: &ResponsesRoute,
+    body: &[u8],
+) -> Result<(), crate::conversations::ConversationError> {
+    if !route.accepts_response_input() {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+        return Ok(());
+    };
+    let Some(payload) = payload.as_object() else {
+        return Ok(());
+    };
+
+    for field in ["context_management", "include"] {
+        require_array_or_null(payload.get(field), field)?;
+    }
+    if route.is_create() {
+        if payload.contains_key("tools") {
+            require_array(payload.get("tools"), "tools")?;
+        }
+    } else {
+        require_array_or_null(payload.get("tools"), "tools")?;
+    }
+    if let Some(instructions) = payload.get("instructions")
+        && !instructions.is_null()
+        && !instructions.is_string()
+    {
+        return Err(crate::conversations::ConversationError::invalid(
+            "instructions",
+            "`instructions` must be a string or null",
+        ));
+    }
+    if let Some(input) = payload.get("input") {
+        match input {
+            Value::String(_) | Value::Array(_) => {}
+            Value::Null if !route.is_create() => {}
+            _ => {
+                return Err(crate::conversations::ConversationError::invalid(
+                    "input",
+                    if route.is_create() {
+                        "`input` must be a string or an array"
+                    } else {
+                        "`input` must be a string, an array, or null"
+                    },
+                ));
+            }
+        }
+        if let Value::Array(items) = input {
+            for (index, item) in items.iter().enumerate() {
+                validate_response_input_item_collections(item, &format!("input[{index}]"))?;
+            }
+        }
+    }
+    if let Some(tool_choice) = payload.get("tool_choice").and_then(Value::as_object)
+        && tool_choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
+    {
+        require_array(tool_choice.get("tools"), "tool_choice.tools")?;
+    }
+    if let Some(tools) = payload.get("tools").and_then(Value::as_array) {
+        for (index, tool) in tools.iter().enumerate() {
+            validate_tool_collections(tool, &format!("tools[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+fn require_array_or_null(
+    value: Option<&Value>,
+    param: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    if value.is_some_and(|value| !value.is_array() && !value.is_null()) {
+        return Err(crate::conversations::ConversationError::invalid(
+            param,
+            format!("`{param}` must be an array or null"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_nullable_array(
+    value: Option<&Value>,
+    param: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    if !value.is_some_and(|value| value.is_array() || value.is_null()) {
+        return Err(crate::conversations::ConversationError::invalid(
+            param,
+            format!("`{param}` must be an array or null"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_array(
+    value: Option<&Value>,
+    param: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    if !value.is_some_and(Value::is_array) {
+        return Err(crate::conversations::ConversationError::invalid(
+            param,
+            format!("`{param}` must be an array"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_array_field(
+    object: &Map<String, Value>,
+    field: &str,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    if object.contains_key(field) {
+        require_array(object.get(field), &format!("{path}.{field}"))?;
+    }
+    Ok(())
+}
+
+fn validate_optional_nullable_array_field(
+    object: &Map<String, Value>,
+    field: &str,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    require_array_or_null(object.get(field), &format!("{path}.{field}"))
+}
+
+pub(crate) fn validate_response_input_item_collections(
+    item: &Value,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    let item = item.as_object().ok_or_else(|| {
+        crate::conversations::ConversationError::invalid(
+            path,
+            "Response input items must be objects",
+        )
+    })?;
+    let item_type = item.get("type").and_then(Value::as_str);
+    if item_type.is_none() && !item.contains_key("role") {
+        return Err(crate::conversations::ConversationError::invalid(
+            format!("{path}.type"),
+            "Response input items require a string `type`",
+        ));
+    }
+    if item_type == Some("message") || item.contains_key("role") {
+        match item.get("content") {
+            Some(Value::String(_) | Value::Array(_)) => {}
+            _ => {
+                return Err(crate::conversations::ConversationError::invalid(
+                    format!("{path}.content"),
+                    "Message `content` must be a string or an array",
+                ));
+            }
+        }
+        if let Some(parts) = item.get("content").and_then(Value::as_array) {
+            for (index, part) in parts.iter().enumerate() {
+                validate_content_part_collections(part, &format!("{path}.content[{index}]"))?;
+            }
+        }
+    }
+    match item_type {
+        Some("reasoning") => {
+            require_array(item.get("summary"), &format!("{path}.summary"))?;
+            validate_optional_array_field(item, "content", path)?;
+        }
+        Some("file_search_call") => {
+            require_array(item.get("queries"), &format!("{path}.queries"))?;
+            validate_optional_nullable_array_field(item, "results", path)?;
+        }
+        Some("computer_call") => {
+            require_array(
+                item.get("pending_safety_checks"),
+                &format!("{path}.pending_safety_checks"),
+            )?;
+            validate_optional_array_field(item, "actions", path)?;
+            if let Some(action) = item.get("action").and_then(Value::as_object) {
+                validate_computer_action_collections(action, &format!("{path}.action"))?;
+            }
+            if let Some(actions) = item.get("actions").and_then(Value::as_array) {
+                for (index, action) in actions.iter().enumerate() {
+                    if let Some(action) = action.as_object() {
+                        validate_computer_action_collections(
+                            action,
+                            &format!("{path}.actions[{index}]"),
+                        )?;
+                    }
+                }
+            }
+        }
+        Some("computer_call_output") => {
+            validate_optional_nullable_array_field(item, "acknowledged_safety_checks", path)?;
+        }
+        Some("web_search_call") => {
+            if let Some(action) = item.get("action").and_then(Value::as_object) {
+                validate_optional_array_field(action, "queries", &format!("{path}.action"))?;
+                validate_optional_array_field(action, "sources", &format!("{path}.action"))?;
+            }
+        }
+        Some("code_interpreter_call") => {
+            require_nullable_array(item.get("outputs"), &format!("{path}.outputs"))?;
+        }
+        Some("local_shell_call") => {
+            if let Some(action) = item.get("action").and_then(Value::as_object) {
+                require_array(action.get("command"), &format!("{path}.action.command"))?;
+            }
+        }
+        Some("shell_call") => {
+            if let Some(action) = item.get("action").and_then(Value::as_object) {
+                require_array(action.get("commands"), &format!("{path}.action.commands"))?;
+            }
+        }
+        Some("shell_call_output") => {
+            require_array(item.get("output"), &format!("{path}.output"))?;
+        }
+        Some("additional_tools" | "tool_search_output") => {
+            require_array(item.get("tools"), &format!("{path}.tools"))?;
+            if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                for (index, tool) in tools.iter().enumerate() {
+                    validate_tool_collections(tool, &format!("{path}.tools[{index}]"))?;
+                }
+            }
+        }
+        Some("mcp_list_tools") => {
+            require_array(item.get("tools"), &format!("{path}.tools"))?;
+        }
+        Some("function_call_output" | "custom_tool_call_output") => {
+            let output = item.get("output").ok_or_else(|| {
+                crate::conversations::ConversationError::invalid(
+                    format!("{path}.output"),
+                    "Tool call `output` is required",
+                )
+            })?;
+            if !output.is_string() && !output.is_array() {
+                return Err(crate::conversations::ConversationError::invalid(
+                    format!("{path}.output"),
+                    "Tool call `output` must be a string or an array",
+                ));
+            }
+            if let Some(parts) = item.get("output").and_then(Value::as_array) {
+                for (index, part) in parts.iter().enumerate() {
+                    validate_content_part_collections(part, &format!("{path}.output[{index}]"))?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_content_part_collections(
+    part: &Value,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    let part = part.as_object().ok_or_else(|| {
+        crate::conversations::ConversationError::invalid(path, "Content parts must be objects")
+    })?;
+    if !part.get("type").is_some_and(Value::is_string) {
+        return Err(crate::conversations::ConversationError::invalid(
+            format!("{path}.type"),
+            "Content parts require a string `type`",
+        ));
+    }
+    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+        require_array(part.get("annotations"), &format!("{path}.annotations"))?;
+    } else {
+        validate_optional_array_field(part, "annotations", path)?;
+    }
+    validate_optional_array_field(part, "logprobs", path)?;
+    if let Some(logprobs) = part.get("logprobs").and_then(Value::as_array) {
+        for (index, logprob) in logprobs.iter().enumerate() {
+            let Some(logprob) = logprob.as_object() else {
+                continue;
+            };
+            let logprob_path = format!("{path}.logprobs[{index}]");
+            require_array(logprob.get("bytes"), &format!("{logprob_path}.bytes"))?;
+            require_array(
+                logprob.get("top_logprobs"),
+                &format!("{logprob_path}.top_logprobs"),
+            )?;
+            if let Some(top_logprobs) = logprob.get("top_logprobs").and_then(Value::as_array) {
+                for (top_index, top_logprob) in top_logprobs.iter().enumerate() {
+                    let Some(top_logprob) = top_logprob.as_object() else {
+                        continue;
+                    };
+                    require_array(
+                        top_logprob.get("bytes"),
+                        &format!("{logprob_path}.top_logprobs[{top_index}].bytes"),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_computer_action_collections(
+    action: &Map<String, Value>,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    validate_optional_nullable_array_field(action, "keys", path)?;
+    if action.get("type").and_then(Value::as_str) == Some("drag") {
+        require_array(action.get("path"), &format!("{path}.path"))?;
+    }
+    Ok(())
+}
+
+fn validate_tool_collections(
+    tool: &Value,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    let tool = tool.as_object().ok_or_else(|| {
+        crate::conversations::ConversationError::invalid(path, "Tools must be objects")
+    })?;
+    if !tool.get("type").is_some_and(Value::is_string) {
+        return Err(crate::conversations::ConversationError::invalid(
+            format!("{path}.type"),
+            "Tools require a string `type`",
+        ));
+    }
+    validate_optional_nullable_array_field(tool, "allowed_callers", path)?;
+    match tool.get("type").and_then(Value::as_str) {
+        Some("file_search") => {
+            require_array(
+                tool.get("vector_store_ids"),
+                &format!("{path}.vector_store_ids"),
+            )?;
+            if let Some(filters) = tool.get("filters") {
+                validate_file_search_filter_collections(filters, &format!("{path}.filters"))?;
+            }
+        }
+        Some("namespace") => {
+            require_array(tool.get("tools"), &format!("{path}.tools"))?;
+            if let Some(tools) = tool.get("tools").and_then(Value::as_array) {
+                for (index, nested) in tools.iter().enumerate() {
+                    validate_tool_collections(nested, &format!("{path}.tools[{index}]"))?;
+                }
+            }
+        }
+        Some("mcp") => {
+            if let Some(allowed_tools) = tool.get("allowed_tools") {
+                match allowed_tools {
+                    Value::Array(_) | Value::Null => {}
+                    Value::Object(filter) => {
+                        validate_optional_array_field(
+                            filter,
+                            "tool_names",
+                            &format!("{path}.allowed_tools"),
+                        )?;
+                    }
+                    _ => {
+                        return Err(crate::conversations::ConversationError::invalid(
+                            format!("{path}.allowed_tools"),
+                            "MCP `allowed_tools` must be an array, filter object, or null",
+                        ));
+                    }
+                }
+            }
+            if let Some(require_approval) = tool.get("require_approval").and_then(Value::as_object)
+            {
+                for policy in ["always", "never"] {
+                    if let Some(filter) = require_approval.get(policy).and_then(Value::as_object) {
+                        validate_optional_array_field(
+                            filter,
+                            "tool_names",
+                            &format!("{path}.require_approval.{policy}"),
+                        )?;
+                    }
+                }
+            }
+        }
+        Some("code_interpreter") => {
+            if let Some(container) = tool.get("container").and_then(Value::as_object) {
+                validate_container_collections(container, &format!("{path}.container"))?;
+            }
+        }
+        Some("shell") => {
+            if let Some(environment) = tool.get("environment").and_then(Value::as_object) {
+                validate_container_collections(environment, &format!("{path}.environment"))?;
+            }
+        }
+        Some(
+            "web_search"
+            | "web_search_2025_08_26"
+            | "web_search_preview"
+            | "web_search_preview_2025_03_11",
+        ) => {
+            validate_optional_array_field(tool, "search_content_types", path)?;
+            if let Some(filters) = tool.get("filters").and_then(Value::as_object) {
+                validate_optional_nullable_array_field(
+                    filters,
+                    "allowed_domains",
+                    &format!("{path}.filters"),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_container_collections(
+    container: &Map<String, Value>,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    validate_optional_array_field(container, "file_ids", path)?;
+    validate_optional_array_field(container, "skills", path)?;
+    if let Some(network_policy) = container.get("network_policy").and_then(Value::as_object) {
+        if network_policy.get("type").and_then(Value::as_str) == Some("allowlist") {
+            require_array(
+                network_policy.get("allowed_domains"),
+                &format!("{path}.network_policy.allowed_domains"),
+            )?;
+        } else {
+            validate_optional_array_field(
+                network_policy,
+                "allowed_domains",
+                &format!("{path}.network_policy"),
+            )?;
+        }
+        validate_optional_array_field(
+            network_policy,
+            "domain_secrets",
+            &format!("{path}.network_policy"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_file_search_filter_collections(
+    filter: &Value,
+    path: &str,
+) -> Result<(), crate::conversations::ConversationError> {
+    let Some(filter) = filter.as_object() else {
+        return Ok(());
+    };
+    if matches!(
+        filter.get("type").and_then(Value::as_str),
+        Some("and" | "or")
+    ) {
+        require_array(filter.get("filters"), &format!("{path}.filters"))?;
+        if let Some(filters) = filter.get("filters").and_then(Value::as_array) {
+            for (index, nested) in filters.iter().enumerate() {
+                validate_file_search_filter_collections(
+                    nested,
+                    &format!("{path}.filters[{index}]"),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_response_item_collections(item: &mut Value) -> bool {
@@ -479,14 +968,14 @@ pub(crate) fn normalize_response_item_collections(item: &mut Value) -> bool {
         }
         Some("file_search_call") => {
             changed |= normalize_array_field(message, "queries");
-            changed |= normalize_array_field(message, "results");
+            changed |= normalize_nullable_array_field(message, "results");
         }
         Some("computer_call") => {
             changed |= normalize_array_field(message, "pending_safety_checks");
             changed |= normalize_computer_actions(message);
         }
         Some("computer_call_output") => {
-            changed |= normalize_array_field(message, "acknowledged_safety_checks");
+            changed |= normalize_nullable_array_field(message, "acknowledged_safety_checks");
         }
         Some("web_search_call") => {
             if let Some(action) = message.get_mut("action").and_then(Value::as_object_mut) {
@@ -495,7 +984,7 @@ pub(crate) fn normalize_response_item_collections(item: &mut Value) -> bool {
             }
         }
         Some("code_interpreter_call") => {
-            changed |= normalize_array_field(message, "outputs");
+            changed |= normalize_nullable_array_field(message, "outputs");
         }
         Some("local_shell_call") => {
             if let Some(action) = message.get_mut("action").and_then(Value::as_object_mut) {
@@ -519,7 +1008,7 @@ pub(crate) fn normalize_response_item_collections(item: &mut Value) -> bool {
             changed |= normalize_array_field(message, "tools");
         }
         Some("function_call_output" | "custom_tool_call_output") => {
-            changed |= normalize_string_or_array_field(message, "output");
+            changed |= normalize_string_or_content_array_field(message, "output");
         }
         _ => {}
     }
@@ -569,7 +1058,12 @@ fn normalize_message_content_part(mut part: Value, role_is_assistant: bool) -> O
     }
     let part_object = part.as_object_mut()?;
     match part_object.get("type") {
-        Some(Value::String(_)) => return Some(part),
+        Some(Value::String(part_type)) => {
+            if part_type == "input_image" && part_object.get("detail").is_none_or(Value::is_null) {
+                part_object.insert("detail".to_string(), Value::String("auto".to_string()));
+            }
+            return Some(part);
+        }
         Some(value) if !value.is_null() => return None,
         _ => {}
     }
@@ -581,14 +1075,15 @@ fn normalize_message_content_part(mut part: Value, role_is_assistant: bool) -> O
             "input_text"
         }
     } else if part_object.contains_key("image_url") {
+        part_object
+            .entry("detail")
+            .or_insert_with(|| Value::String("auto".to_string()));
         "input_image"
     } else if ["file_data", "file_id", "file_url", "filename"]
         .iter()
         .any(|field| part_object.contains_key(*field))
     {
         "input_file"
-    } else if part_object.contains_key("input_audio") || part_object.contains_key("audio_url") {
-        "input_audio"
     } else {
         return None;
     };
@@ -745,7 +1240,7 @@ fn normalize_computer_actions(item: &mut Map<String, Value>) -> bool {
 }
 
 fn normalize_computer_action(action: &mut Map<String, Value>) -> bool {
-    let mut changed = normalize_array_field(action, "keys");
+    let mut changed = normalize_nullable_array_field(action, "keys");
     if action.get("type").and_then(Value::as_str) == Some("drag") {
         changed |= normalize_array_field(action, "path");
     }
@@ -767,11 +1262,14 @@ fn normalize_tool_collections(tool: &mut Value) -> bool {
         return false;
     };
     let tool_type = tool.get("type").and_then(Value::as_str).map(str::to_owned);
-    let mut changed = normalize_array_field(tool, "allowed_callers");
+    let mut changed = normalize_nullable_array_field(tool, "allowed_callers");
 
     match tool_type.as_deref() {
         Some("file_search") => {
             changed |= normalize_array_field(tool, "vector_store_ids");
+            if let Some(filters) = tool.get_mut("filters") {
+                changed |= normalize_file_search_filter(filters);
+            }
         }
         Some("namespace") => {
             changed |= normalize_tools_field(tool, "tools");
@@ -783,10 +1281,7 @@ fn normalize_tool_collections(tool: &mut Value) -> bool {
                         changed |= normalize_array_field(filter, "tool_names");
                     }
                     Value::Array(_) => {}
-                    Value::Null => {
-                        *allowed_tools = Value::Array(Vec::new());
-                        changed = true;
-                    }
+                    Value::Null => {}
                     _ => {
                         let allowed_tool = allowed_tools.take();
                         *allowed_tools = Value::Array(vec![allowed_tool]);
@@ -818,13 +1313,37 @@ fn normalize_tool_collections(tool: &mut Value) -> bool {
                 changed |= normalize_container_collections(environment);
             }
         }
-        Some("web_search" | "web_search_preview" | "web_search_preview_2025_03_11") => {
+        Some(
+            "web_search"
+            | "web_search_2025_08_26"
+            | "web_search_preview"
+            | "web_search_preview_2025_03_11",
+        ) => {
             changed |= normalize_array_field(tool, "search_content_types");
             if let Some(filters) = tool.get_mut("filters").and_then(Value::as_object_mut) {
-                changed |= normalize_array_field(filters, "allowed_domains");
+                changed |= normalize_nullable_array_field(filters, "allowed_domains");
             }
         }
         _ => {}
+    }
+    changed
+}
+
+fn normalize_file_search_filter(filter: &mut Value) -> bool {
+    let Some(filter) = filter.as_object_mut() else {
+        return false;
+    };
+    if !matches!(
+        filter.get("type").and_then(Value::as_str),
+        Some("and" | "or")
+    ) {
+        return false;
+    }
+    let mut changed = normalize_array_field(filter, "filters");
+    if let Some(filters) = filter.get_mut("filters").and_then(Value::as_array_mut) {
+        for filter in filters {
+            changed |= normalize_file_search_filter(filter);
+        }
     }
     changed
 }
@@ -864,20 +1383,33 @@ fn normalize_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
     }
 }
 
-fn normalize_string_or_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
+fn normalize_nullable_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
+    if object.get(field).is_some_and(Value::is_null) {
+        return false;
+    }
+    normalize_array_field(object, field)
+}
+
+fn normalize_string_or_content_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
     let Some(value) = object.get_mut(field) else {
         return false;
     };
-    if matches!(value, Value::String(_) | Value::Array(_)) {
+    if value.is_string() {
         return false;
     }
-    if value.is_null() {
-        *value = Value::Array(Vec::new());
-    } else {
-        let item = value.take();
-        *value = Value::Array(vec![item]);
-    }
-    true
+    let original = value.clone();
+    let candidates = match value.take() {
+        Value::Array(values) => values,
+        Value::Null => Vec::new(),
+        value => vec![value],
+    };
+    *value = Value::Array(
+        candidates
+            .into_iter()
+            .filter_map(|part| normalize_message_content_part(part, false))
+            .collect(),
+    );
+    *value != original
 }
 
 fn require_chatgpt_auth(auth: Option<CodexAuth>) -> Result<CodexAuth> {

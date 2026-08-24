@@ -337,7 +337,21 @@ impl ConversationStore {
         let metadata = validate_metadata(request.get("metadata"))?;
         let items = match request.get("items") {
             None | Some(Value::Null) => Vec::new(),
-            Some(items) => normalize_items(items, "items")?,
+            Some(Value::Array(items)) => {
+                if items.len() > MAX_ITEMS_PER_REQUEST {
+                    return Err(ConversationError::invalid(
+                        "items",
+                        format!("You may add at most {MAX_ITEMS_PER_REQUEST} items at a time"),
+                    ));
+                }
+                normalize_item_values(items, "items")?
+            }
+            Some(_) => {
+                return Err(ConversationError::invalid(
+                    "items",
+                    "`items` must be an array or null",
+                ));
+            }
         };
         reject_unknown_fields(&request, &["items", "metadata"])?;
 
@@ -417,7 +431,16 @@ impl ConversationStore {
         let items = request
             .get("items")
             .ok_or_else(|| ConversationError::invalid("items", "`items` is required"))?;
-        let items = normalize_items(items, "items")?;
+        let items = items
+            .as_array()
+            .ok_or_else(|| ConversationError::invalid("items", "`items` must be an array"))?;
+        if items.len() > MAX_ITEMS_PER_REQUEST {
+            return Err(ConversationError::invalid(
+                "items",
+                format!("You may add at most {MAX_ITEMS_PER_REQUEST} items at a time"),
+            ));
+        }
+        let items = normalize_item_values(items, "items")?;
         let response_items = items
             .iter()
             .map(|item| item.value.clone())
@@ -1004,7 +1027,11 @@ fn translated_headers(upstream: &HeaderMap, content_type: &'static str) -> Heade
 
 fn normalize_response_input(value: Option<&Value>) -> Result<Vec<StoredItem>, ConversationError> {
     match value {
-        None | Some(Value::Null) => Ok(Vec::new()),
+        None => Ok(Vec::new()),
+        Some(Value::Null) => Err(ConversationError::invalid(
+            "input",
+            "`input` must be a string or an array",
+        )),
         Some(Value::String(text)) => normalize_item_values(
             &[serde_json::json!({
                 "type": "message",
@@ -1014,7 +1041,10 @@ fn normalize_response_input(value: Option<&Value>) -> Result<Vec<StoredItem>, Co
             "input",
         ),
         Some(Value::Array(items)) => normalize_item_values(items, "input"),
-        Some(item) => normalize_item_values(std::slice::from_ref(item), "input"),
+        Some(_) => Err(ConversationError::invalid(
+            "input",
+            "`input` must be a string or an array",
+        )),
     }
 }
 
@@ -1093,12 +1123,20 @@ fn resolve_route(method: &Method, uri: &Uri) -> Result<ConversationsRoute, Conve
             "Invalid Conversations path",
         ));
     }
-    let segments = segments
-        .strip_prefix('/')
-        .unwrap_or_default()
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
+    let segments = if segments.is_empty() {
+        Vec::new()
+    } else {
+        let segments = segments
+            .strip_prefix('/')
+            .ok_or_else(|| ConversationError::invalid("path", "Invalid Conversations path"))?;
+        if segments.is_empty() {
+            return Err(ConversationError::invalid(
+                "path",
+                "Invalid Conversations path",
+            ));
+        }
+        segments.split('/').collect::<Vec<_>>()
+    };
     if segments.iter().any(|segment| !valid_segment(segment)) {
         return Err(ConversationError::invalid(
             "path",
@@ -1164,13 +1202,25 @@ fn parse_list_query(query: Option<&str>) -> Result<ListQuery, ConversationError>
     let Some(query) = query else {
         return Ok(parsed);
     };
+    if query.is_empty() {
+        return Err(ConversationError::invalid("query", "Invalid query string"));
+    }
     let url = reqwest::Url::parse(&format!("http://localhost/?{query}"))
         .map_err(|_| ConversationError::invalid("query", "Invalid query string"))?;
+    let mut seen = HashSet::new();
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
-            "after" if parsed.after.is_none() => parsed.after = Some(value.into_owned()),
-            "include" | "include[]" => {}
+            "after" if seen.insert("after") && !value.is_empty() => {
+                parsed.after = Some(value.into_owned())
+            }
+            "include" | "include[]" if valid_include(&value) => {}
             "limit" => {
+                if !seen.insert("limit") {
+                    return Err(ConversationError::invalid(
+                        "limit",
+                        "`limit` may only be specified once",
+                    ));
+                }
                 let limit = value.parse::<usize>().map_err(|_| {
                     ConversationError::invalid("limit", "`limit` must be an integer")
                 })?;
@@ -1181,6 +1231,12 @@ fn parse_list_query(query: Option<&str>) -> Result<ListQuery, ConversationError>
                     ));
                 }
                 parsed.limit = limit;
+            }
+            "order" if !seen.insert("order") => {
+                return Err(ConversationError::invalid(
+                    "order",
+                    "`order` may only be specified once",
+                ));
             }
             "order" if value == "asc" => parsed.order = ListOrder::Asc,
             "order" if value == "desc" => parsed.order = ListOrder::Desc,
@@ -1205,10 +1261,13 @@ fn validate_include_only(query: Option<&str>) -> Result<(), ConversationError> {
     let Some(query) = query else {
         return Ok(());
     };
+    if query.is_empty() {
+        return Err(ConversationError::invalid("query", "Invalid query string"));
+    }
     let url = reqwest::Url::parse(&format!("http://localhost/?{query}"))
         .map_err(|_| ConversationError::invalid("query", "Invalid query string"))?;
-    for (name, _) in url.query_pairs() {
-        if !matches!(name.as_ref(), "include" | "include[]") {
+    for (name, value) in url.query_pairs() {
+        if !matches!(name.as_ref(), "include" | "include[]") || !valid_include(&value) {
             return Err(ConversationError::invalid(
                 name.into_owned(),
                 "Unsupported query parameter",
@@ -1216,6 +1275,20 @@ fn validate_include_only(query: Option<&str>) -> Result<(), ConversationError> {
         }
     }
     Ok(())
+}
+
+fn valid_include(value: &str) -> bool {
+    matches!(
+        value,
+        "web_search_call.action.sources"
+            | "web_search_call.results"
+            | "code_interpreter_call.outputs"
+            | "computer_call_output.output.image_url"
+            | "file_search_call.results"
+            | "message.input_image.image_url"
+            | "message.output_text.logprobs"
+            | "reasoning.encrypted_content"
+    )
 }
 
 fn valid_segment(segment: &str) -> bool {
@@ -1297,25 +1370,6 @@ fn validate_metadata(value: Option<&Value>) -> Result<Value, ConversationError> 
     Ok(Value::Object(metadata))
 }
 
-fn normalize_items(value: &Value, param: &str) -> Result<Vec<StoredItem>, ConversationError> {
-    let singleton;
-    let items = match value {
-        Value::Array(items) => items.as_slice(),
-        Value::Null => &[],
-        item => {
-            singleton = [item.clone()];
-            singleton.as_slice()
-        }
-    };
-    if items.len() > MAX_ITEMS_PER_REQUEST {
-        return Err(ConversationError::invalid(
-            param,
-            format!("You may add at most {MAX_ITEMS_PER_REQUEST} items at a time"),
-        ));
-    }
-    normalize_item_values(items, param)
-}
-
 fn normalize_item_values(
     items: &[Value],
     param: &str,
@@ -1325,6 +1379,10 @@ fn normalize_item_values(
         .iter()
         .enumerate()
         .map(|(index, item)| {
+            crate::chatgpt::validate_response_input_item_collections(
+                item,
+                &format!("{param}[{index}]"),
+            )?;
             let mut item = item.as_object().cloned().ok_or_else(|| {
                 ConversationError::invalid(
                     format!("{param}[{index}]"),
@@ -1335,7 +1393,7 @@ fn normalize_item_values(
                 item.insert("type".to_string(), Value::String("message".to_string()));
             }
             let mut value = Value::Object(item);
-            crate::chatgpt::normalize_response_item_collections(&mut value);
+            crate::chatgpt::normalize_public_response_input_item(&mut value);
             let Value::Object(mut item) = value else {
                 return Err(ConversationError::internal(
                     "Normalized conversation item is not an object",

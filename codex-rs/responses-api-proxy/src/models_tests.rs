@@ -180,6 +180,18 @@ async fn recognizes_only_models_paths_and_get_operations() {
         .status(),
         StatusCode::METHOD_NOT_ALLOWED
     );
+    assert_eq!(
+        handle(
+            &state,
+            &Method::GET,
+            "/v1/models?limit=1",
+            &HeaderMap::new()
+        )
+        .await
+        .expect("Models route")
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[test]

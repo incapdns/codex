@@ -75,15 +75,32 @@ struct ErrorBody {
 pub(crate) async fn handle(
     state: &ChatgptState,
     method: &Method,
-    path: &str,
+    request_uri: &str,
     incoming_headers: &HeaderMap,
 ) -> Option<Response> {
+    let (path, query) = match request_uri.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (request_uri, None),
+    };
     let model_id = match path {
         MODELS_PATH => None,
         _ => path.strip_prefix("/v1/models/"),
     };
     if path != MODELS_PATH && model_id.is_none() {
         return None;
+    }
+    if query.is_some() {
+        return Some(error_response(
+            StatusCode::BAD_REQUEST,
+            "The Models resource does not accept query parameters".to_string(),
+            None,
+            "invalid_query",
+        ));
+    }
+    if let Some(model_id) = model_id
+        && (model_id.is_empty() || model_id.contains('/'))
+    {
+        return Some(model_not_found(model_id));
     }
     if method != Method::GET {
         return Some(error_response(
@@ -113,13 +130,12 @@ pub(crate) async fn handle(
             data: models,
         })
         .into_response(),
-        Some(model_id) if !model_id.is_empty() && !model_id.contains('/') => models
+        Some(model_id) => models
             .into_iter()
             .find(|model| model.id == model_id)
             .map(Json)
             .map(IntoResponse::into_response)
             .unwrap_or_else(|| model_not_found(model_id)),
-        Some(model_id) => model_not_found(model_id),
     })
 }
 

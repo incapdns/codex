@@ -111,14 +111,18 @@ public API's string and easy-message shorthand forms and expands them to equival
 empty input list when those optional public-API fields are omitted. Explicit values and already
 structured item lists are preserved.
 
-For schema fields declared as collections, the compatibility layer also accepts a single value and
-wraps it in a one-element array; `null` becomes an empty array. This applies recursively to the
-documented request structures, including message `content`, output-text `annotations` and
-`logprobs`, reasoning content, tool definitions, search results, computer actions, and shell
-inputs/outputs. The coercion is path- and type-aware: arbitrary JSON objects such as function
+Request collection types follow the public contract strictly. Fields declared only as arrays—such
+as `tools`, `include`, `context_management`, Conversation `items`, compound-filter `filters`, and
+structured message content—reject singleton objects instead of silently wrapping them. Only the
+documented `string | array` shorthands, notably Responses `input` and easy-message text content, are
+expanded to canonical arrays for the Codex backend. Nullable fields preserve `null` where the
+public contract permits it.
+
+Backend-generated and previously stored Conversation output is normalized separately before it is
+replayed. For public response fields that must be collections, typed singleton/map quirks are
+converted to arrays without weakening request validation. Arbitrary JSON objects such as function
 schemas, metadata, MCP tool annotations, and tool arguments are never rewritten merely because a
-property has the same name. Stored and replayed Conversation items use the same normalization, so
-older singleton-shaped history cannot produce an invalid upstream request.
+property has the same name.
 
 Output-text annotations receive additional schema validation because every official annotation
 requires a string `type` discriminator. A typed singleton is wrapped, maps of typed annotations are
@@ -129,9 +133,10 @@ Reasoning collections are normalized by their fixed public discriminators as wel
 object or string becomes a `summary_text` item, reasoning content becomes a `reasoning_text` item,
 and empty, unrecognized, or incorrectly discriminated entries are omitted.
 
-Message content receives the equivalent treatment: text, image, file, and audio objects with an
+Message content receives the equivalent treatment: text, image, and file objects with an
 unambiguous payload receive their public content-part discriminator, while empty or unrecognized
-objects are omitted rather than forwarded as an invalid content item.
+objects are omitted rather than forwarded as an invalid content item. Image inputs without an
+explicit detail level receive the public `auto` default.
 
 ## Conversations compatibility
 
@@ -197,10 +202,11 @@ conversation_compact_after_items = 80 # 0 disables automatic compaction
 ChatGPT auth mode exposes `POST /v1/chat/completions` as a compatibility adapter over the
 Responses upstream. It follows the public
 [OpenAI Chat Completions create contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
-for the common text, image, file, function-tool, structured-output, reasoning, streaming, and usage
-fields. Requests are converted to Responses input items; Responses JSON or SSE output is converted
-back to `chat.completion` or `chat.completion.chunk` objects. Non-streaming calls are assembled
-locally from an upstream event stream, so both `stream: false` and `stream: true` are available.
+for text, image, file, function/custom-tool, allowed-tool-choice, structured-output, reasoning,
+moderation, prompt-cache, streaming, and usage fields whose semantics can be preserved. Requests are
+converted to Responses input items; Responses JSON or SSE output is converted back to
+`chat.completion` or `chat.completion.chunk` objects. Non-streaming calls are assembled locally from
+an upstream event stream, so both `stream: false` and `stream: true` are available.
 
 The adapter intentionally rejects parameters whose semantics cannot be preserved instead of
 silently dropping them. It supports one choice per request (`n: 1`). Stored Chat Completions and

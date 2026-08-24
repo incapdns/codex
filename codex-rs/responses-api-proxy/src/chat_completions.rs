@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
 
@@ -119,6 +120,53 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
     let request = payload
         .as_object()
         .ok_or_else(|| CompatError::invalid("body", "Request body must be a JSON object"))?;
+    for field in request.keys() {
+        if !matches!(
+            field.as_str(),
+            "audio"
+                | "frequency_penalty"
+                | "function_call"
+                | "functions"
+                | "logit_bias"
+                | "logprobs"
+                | "max_completion_tokens"
+                | "max_tokens"
+                | "messages"
+                | "metadata"
+                | "modalities"
+                | "model"
+                | "moderation"
+                | "n"
+                | "parallel_tool_calls"
+                | "prediction"
+                | "presence_penalty"
+                | "prompt_cache_key"
+                | "prompt_cache_options"
+                | "prompt_cache_retention"
+                | "reasoning_effort"
+                | "response_format"
+                | "safety_identifier"
+                | "seed"
+                | "service_tier"
+                | "stop"
+                | "store"
+                | "stream"
+                | "stream_options"
+                | "temperature"
+                | "tool_choice"
+                | "tools"
+                | "top_logprobs"
+                | "top_p"
+                | "user"
+                | "verbosity"
+                | "web_search_options"
+        ) {
+            return Err(CompatError::invalid(
+                field,
+                format!("Unknown parameter `{field}`"),
+            ));
+        }
+    }
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -136,20 +184,51 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
         .and_then(|options| options.get("include_usage"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if let Some(options) = request
+        .get("stream_options")
+        .filter(|value| !value.is_null())
+    {
+        if !client_stream {
+            return Err(CompatError::invalid(
+                "stream_options",
+                "`stream_options` may only be set when `stream` is true",
+            ));
+        }
+        let options = options.as_object().ok_or_else(|| {
+            CompatError::invalid("stream_options", "`stream_options` must be an object")
+        })?;
+        for (name, value) in options {
+            if !matches!(name.as_str(), "include_obfuscation" | "include_usage") {
+                return Err(CompatError::invalid(
+                    format!("stream_options.{name}"),
+                    format!("Unknown parameter `stream_options.{name}`"),
+                ));
+            }
+            if !matches!(value, Value::Bool(_)) {
+                return Err(CompatError::invalid(
+                    format!("stream_options.{name}"),
+                    format!("`stream_options.{name}` must be a boolean"),
+                ));
+            }
+        }
+    }
 
-    if request.get("store").and_then(Value::as_bool) == Some(true) {
+    if optional_bool(request, "store")? == Some(true) {
         return Err(CompatError::invalid(
             "store",
             "`store: true` is unavailable because the ChatGPT Responses backend requires `store: false`",
         ));
     }
-    if let Some(n) = request.get("n").and_then(Value::as_u64)
-        && n != 1
-    {
-        return Err(CompatError::invalid(
-            "n",
-            "Only `n: 1` is supported by the Responses API compatibility layer",
-        ));
+    if let Some(n) = request.get("n").filter(|value| !value.is_null()) {
+        let n = n
+            .as_u64()
+            .ok_or_else(|| CompatError::invalid("n", "`n` must be a positive integer"))?;
+        if n != 1 {
+            return Err(CompatError::invalid(
+                "n",
+                "Only `n: 1` is supported by the Responses API compatibility layer",
+            ));
+        }
     }
     for unsupported in [
         "audio",
@@ -173,8 +252,9 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
     }
 
     let mut input = Vec::new();
+    let mut custom_call_ids = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
-        translate_message(message, index, &mut input)?;
+        translate_message(message, index, &mut input, &mut custom_call_ids)?;
     }
 
     let mut responses = Map::new();
@@ -188,7 +268,10 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
     for field in [
         "metadata",
         "parallel_tool_calls",
+        "moderation",
         "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
         "safety_identifier",
         "service_tier",
         "temperature",
@@ -197,10 +280,19 @@ fn translate_request(body: &[u8]) -> Result<TranslatedRequest, CompatError> {
     ] {
         copy_if_present(request, &mut responses, field, field);
     }
-    if let Some(max_tokens) = request
+    let max_completion_tokens = request
         .get("max_completion_tokens")
-        .or_else(|| request.get("max_tokens"))
+        .filter(|value| !value.is_null());
+    let legacy_max_tokens = request.get("max_tokens").filter(|value| !value.is_null());
+    if let (Some(current), Some(legacy)) = (max_completion_tokens, legacy_max_tokens)
+        && current != legacy
     {
+        return Err(CompatError::invalid(
+            "max_tokens",
+            "`max_tokens` and `max_completion_tokens` cannot specify different values",
+        ));
+    }
+    if let Some(max_tokens) = max_completion_tokens.or(legacy_max_tokens) {
         responses.insert("max_output_tokens".to_string(), max_tokens.clone());
     }
     if let Some(reasoning_effort) = request.get("reasoning_effort") {
@@ -259,6 +351,7 @@ fn translate_message(
     value: &Value,
     index: usize,
     input: &mut Vec<Value>,
+    custom_call_ids: &mut HashSet<String>,
 ) -> Result<(), CompatError> {
     let message = value.as_object().ok_or_else(|| {
         CompatError::invalid(
@@ -275,8 +368,44 @@ fn translate_message(
     if message.get("name").is_some_and(|value| !value.is_null()) {
         return Err(CompatError::unsupported(format!("messages[{index}].name")));
     }
+    if message.get("audio").is_some_and(|value| !value.is_null()) {
+        return Err(CompatError::unsupported(format!("messages[{index}].audio")));
+    }
+    if message
+        .get("function_call")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(CompatError::unsupported(format!(
+            "messages[{index}].function_call"
+        )));
+    }
+    for field in message.keys() {
+        let supported = match role {
+            "assistant" => matches!(
+                field.as_str(),
+                "role" | "audio" | "content" | "function_call" | "name" | "refusal" | "tool_calls"
+            ),
+            "tool" => matches!(field.as_str(), "role" | "content" | "tool_call_id"),
+            "developer" | "system" | "user" => {
+                matches!(field.as_str(), "role" | "content" | "name")
+            }
+            _ => true,
+        };
+        if !supported {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].{field}"),
+                format!("Unknown parameter `messages[{index}].{field}`"),
+            ));
+        }
+    }
 
     if role == "tool" {
+        if !message.contains_key("content") {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].content"),
+                "Tool message `content` is required",
+            ));
+        }
         let call_id = message
             .get("tool_call_id")
             .and_then(Value::as_str)
@@ -286,9 +415,14 @@ fn translate_message(
                     "Tool messages require `tool_call_id`",
                 )
             })?;
-        let output = tool_output_text(message.get("content"), index)?;
+        let output = translate_tool_output(message.get("content"), index)?;
+        let output_type = if custom_call_ids.contains(call_id) {
+            "custom_tool_call_output"
+        } else {
+            "function_call_output"
+        };
         input.push(serde_json::json!({
-            "type": "function_call_output",
+            "type": output_type,
             "call_id": call_id,
             "output": output,
         }));
@@ -300,8 +434,39 @@ fn translate_message(
             format!("Unsupported message role `{role}`"),
         ));
     }
+    if role != "assistant" && message.get("content").is_none_or(Value::is_null) {
+        return Err(CompatError::invalid(
+            format!("messages[{index}].content"),
+            "Message `content` is required",
+        ));
+    }
+    if role == "assistant"
+        && !["content", "tool_calls", "refusal"]
+            .iter()
+            .any(|field| message.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(CompatError::invalid(
+            format!("messages[{index}].content"),
+            "Assistant messages require `content`, `tool_calls`, or `refusal`",
+        ));
+    }
 
-    let content = translate_message_content(message.get("content"), role, index)?;
+    let mut content = translate_message_content(message.get("content"), role, index)?;
+    if let Some(refusal) = message.get("refusal").filter(|value| !value.is_null()) {
+        if role != "assistant" {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].refusal"),
+                "Only assistant messages may contain `refusal`",
+            ));
+        }
+        let refusal = refusal.as_str().ok_or_else(|| {
+            CompatError::invalid(
+                format!("messages[{index}].refusal"),
+                "`refusal` must be a string or null",
+            )
+        })?;
+        content.push(serde_json::json!({"type": "refusal", "refusal": refusal}));
+    }
     if !content.is_empty() {
         input.push(serde_json::json!({
             "type": "message",
@@ -309,16 +474,13 @@ fn translate_message(
             "content": content,
         }));
     }
-    if role == "assistant"
-        && let Some(refusal) = message.get("refusal").and_then(Value::as_str)
-    {
-        input.push(serde_json::json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "refusal", "refusal": refusal}],
-        }));
-    }
     if let Some(tool_calls) = message.get("tool_calls") {
+        if role != "assistant" {
+            return Err(CompatError::invalid(
+                format!("messages[{index}].tool_calls"),
+                "Only assistant messages may contain `tool_calls`",
+            ));
+        }
         let tool_calls = tool_calls.as_array().ok_or_else(|| {
             CompatError::invalid(
                 format!("messages[{index}].tool_calls"),
@@ -326,7 +488,13 @@ fn translate_message(
             )
         })?;
         for (tool_index, tool_call) in tool_calls.iter().enumerate() {
-            input.push(translate_tool_call(tool_call, index, tool_index)?);
+            let translated = translate_tool_call(tool_call, index, tool_index)?;
+            if translated.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+                && let Some(call_id) = translated.get("call_id").and_then(Value::as_str)
+            {
+                custom_call_ids.insert(call_id.to_string());
+            }
+            input.push(translated);
         }
     }
     Ok(())
@@ -342,7 +510,7 @@ fn translate_message_content(
     };
     match content {
         Value::Null => Ok(Vec::new()),
-        Value::String(text) => Ok(vec![text_content(role, text)]),
+        Value::String(text) => Ok(vec![text_content(role, text, None)]),
         Value::Array(parts) => parts
             .iter()
             .enumerate()
@@ -354,7 +522,16 @@ fn translate_message_content(
                     )
                 })?;
                 match object.get("type").and_then(Value::as_str) {
-                    Some("text" | "input_text" | "output_text") => {
+                    Some("text") => {
+                        if role == "assistant"
+                            && object
+                                .get("prompt_cache_breakpoint")
+                                .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(CompatError::unsupported(format!(
+                                "messages[{message_index}].content[{part_index}].prompt_cache_breakpoint"
+                            )));
+                        }
                         let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
                             CompatError::invalid(
                                 format!(
@@ -363,10 +540,10 @@ fn translate_message_content(
                                 "Text content requires `text`",
                             )
                         })?;
-                        Ok(text_content(role, text))
+                        Ok(text_content(role, text, Some(object)))
                     }
                     Some("image_url") => {
-                        if role == "assistant" {
+                        if role != "user" {
                             return Err(CompatError::unsupported(format!(
                                 "messages[{message_index}].content[{part_index}]"
                             )));
@@ -380,7 +557,6 @@ fn translate_message_content(
                             )
                         })?;
                         let (url, detail) = match image {
-                            Value::String(url) => (url.as_str(), None),
                             Value::Object(image) => (
                                 image.get("url").and_then(Value::as_str).ok_or_else(|| {
                                     CompatError::invalid(
@@ -390,33 +566,48 @@ fn translate_message_content(
                                         "Image content requires a URL",
                                     )
                                 })?,
-                                image.get("detail").cloned(),
+                                image
+                                    .get("detail")
+                                    .filter(|value| !value.is_null())
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::String("auto".to_string())),
                             ),
                             _ => {
                                 return Err(CompatError::invalid(
                                     format!(
                                         "messages[{message_index}].content[{part_index}].image_url"
                                     ),
-                                    "`image_url` must be a string or object",
+                                    "`image_url` must be an object",
                                 ));
                             }
                         };
                         let mut translated = serde_json::json!({
                             "type": "input_image",
                             "image_url": url,
+                            "detail": detail,
                         });
-                        if let Some(detail) = detail {
-                            translated["detail"] = detail;
-                        }
+                        copy_prompt_cache_breakpoint(object, &mut translated);
                         Ok(translated)
                     }
                     Some("file") => {
-                        if role == "assistant" {
+                        if role != "user" {
                             return Err(CompatError::unsupported(format!(
                                 "messages[{message_index}].content[{part_index}]"
                             )));
                         }
                         translate_file_content(object, message_index, part_index)
+                    }
+                    Some("refusal") if role == "assistant" => {
+                        let refusal =
+                            object.get("refusal").and_then(Value::as_str).ok_or_else(|| {
+                                CompatError::invalid(
+                                    format!(
+                                        "messages[{message_index}].content[{part_index}].refusal"
+                                    ),
+                                    "Refusal content requires `refusal`",
+                                )
+                            })?;
+                        Ok(serde_json::json!({"type": "refusal", "refusal": refusal}))
                     }
                     Some(kind) => Err(CompatError::unsupported(format!(
                         "messages[{message_index}].content[{part_index}].type={kind}"
@@ -476,43 +667,66 @@ fn translate_file_content(
     Ok(Value::Object(translated))
 }
 
-fn text_content(role: &str, text: &str) -> Value {
-    if role == "assistant" {
+fn text_content(role: &str, text: &str, source: Option<&Map<String, Value>>) -> Value {
+    let mut translated = if role == "assistant" {
         serde_json::json!({"type": "output_text", "text": text})
     } else {
         serde_json::json!({"type": "input_text", "text": text})
+    };
+    if let Some(source) = source {
+        copy_prompt_cache_breakpoint(source, &mut translated);
+    }
+    translated
+}
+
+fn copy_prompt_cache_breakpoint(source: &Map<String, Value>, destination: &mut Value) {
+    if let Some(breakpoint) = source
+        .get("prompt_cache_breakpoint")
+        .filter(|value| !value.is_null())
+    {
+        destination["prompt_cache_breakpoint"] = breakpoint.clone();
     }
 }
 
-fn tool_output_text(content: Option<&Value>, message_index: usize) -> Result<String, CompatError> {
+fn translate_tool_output(
+    content: Option<&Value>,
+    message_index: usize,
+) -> Result<Value, CompatError> {
     match content {
-        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::String(text)) => Ok(Value::String(text.clone())),
         Some(Value::Array(parts)) => {
-            let mut output = String::new();
+            let mut output = Vec::with_capacity(parts.len());
             for (part_index, part) in parts.iter().enumerate() {
-                let text = part
-                    .as_object()
-                    .filter(|part| {
-                        matches!(
-                            part.get("type").and_then(Value::as_str),
-                            Some("text" | "input_text" | "output_text")
-                        )
-                    })
-                    .and_then(|part| part.get("text"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        CompatError::unsupported(format!(
-                            "messages[{message_index}].content[{part_index}]"
-                        ))
-                    })?;
-                output.push_str(text);
+                let part = part.as_object().ok_or_else(|| {
+                    CompatError::invalid(
+                        format!("messages[{message_index}].content[{part_index}]"),
+                        "Tool output content parts must be objects",
+                    )
+                })?;
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err(CompatError::unsupported(format!(
+                        "messages[{message_index}].content[{part_index}]"
+                    )));
+                }
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    CompatError::invalid(
+                        format!("messages[{message_index}].content[{part_index}].text"),
+                        "Tool output text parts require `text`",
+                    )
+                })?;
+                let mut translated = serde_json::json!({"type": "input_text", "text": text});
+                copy_prompt_cache_breakpoint(part, &mut translated);
+                output.push(translated);
             }
-            Ok(output)
+            Ok(Value::Array(output))
         }
-        Some(Value::Null) | None => Ok(String::new()),
+        Some(Value::Null) | None => Err(CompatError::invalid(
+            format!("messages[{message_index}].content"),
+            "Tool output must be a string or text-part array",
+        )),
         Some(_) => Err(CompatError::invalid(
             format!("messages[{message_index}].content"),
-            "Tool output must be a string, text-part array, or null",
+            "Tool output must be a string or text-part array",
         )),
     }
 }
@@ -526,108 +740,168 @@ fn translate_tool_call(
     let call = value
         .as_object()
         .ok_or_else(|| CompatError::invalid(&path, "Tool calls must be objects"))?;
-    if call.get("type").and_then(Value::as_str) != Some("function") {
-        return Err(CompatError::unsupported(format!("{path}.type")));
-    }
     let call_id = call
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| CompatError::invalid(format!("{path}.id"), "Tool calls require `id`"))?;
-    let function = call
-        .get("function")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            CompatError::invalid(
-                format!("{path}.function"),
-                "Function tool calls require `function`",
-            )
-        })?;
-    let name = function
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CompatError::invalid(
-                format!("{path}.function.name"),
-                "Function tool calls require `name`",
-            )
-        })?;
-    let arguments = function
-        .get("arguments")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CompatError::invalid(
-                format!("{path}.function.arguments"),
-                "Function tool calls require string `arguments`",
-            )
-        })?;
-    Ok(serde_json::json!({
-        "type": "function_call",
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-    }))
+    match call.get("type").and_then(Value::as_str) {
+        Some("function") => {
+            let function = call
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CompatError::invalid(
+                        format!("{path}.function"),
+                        "Function tool calls require `function`",
+                    )
+                })?;
+            let name = required_string(function, "name", &format!("{path}.function"))?;
+            let arguments = required_string(function, "arguments", &format!("{path}.function"))?;
+            Ok(serde_json::json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }))
+        }
+        Some("custom") => {
+            let custom = call
+                .get("custom")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CompatError::invalid(
+                        format!("{path}.custom"),
+                        "Custom tool calls require `custom`",
+                    )
+                })?;
+            let name = required_string(custom, "name", &format!("{path}.custom"))?;
+            let custom_input = required_string(custom, "input", &format!("{path}.custom"))?;
+            Ok(serde_json::json!({
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": name,
+                "input": custom_input,
+            }))
+        }
+        Some(kind) => Err(CompatError::unsupported(format!("{path}.type={kind}"))),
+        None => Err(CompatError::invalid(
+            format!("{path}.type"),
+            "Tool calls require `type`",
+        )),
+    }
+}
+
+fn required_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+    path: &str,
+) -> Result<&'a str, CompatError> {
+    object.get(field).and_then(Value::as_str).ok_or_else(|| {
+        CompatError::invalid(
+            format!("{path}.{field}"),
+            format!("`{path}.{field}` must be a string"),
+        )
+    })
 }
 
 fn translate_tools(
     request: &Map<String, Value>,
     responses: &mut Map<String, Value>,
 ) -> Result<(), CompatError> {
-    let tools = if let Some(tools) = request.get("tools") {
-        tools
-            .as_array()
-            .cloned()
-            .ok_or_else(|| CompatError::invalid("tools", "`tools` must be an array"))?
-    } else if let Some(functions) = request.get("functions") {
-        functions
-            .as_array()
-            .ok_or_else(|| CompatError::invalid("functions", "`functions` must be an array"))?
-            .iter()
-            .map(|function| serde_json::json!({"type": "function", "function": function}))
-            .collect()
-    } else {
+    let mut tools = Vec::new();
+    if let Some(value) = request.get("tools") {
+        tools.extend(
+            value
+                .as_array()
+                .ok_or_else(|| CompatError::invalid("tools", "`tools` must be an array"))?
+                .iter()
+                .cloned(),
+        );
+    }
+    if let Some(value) = request.get("functions") {
+        tools.extend(
+            value
+                .as_array()
+                .ok_or_else(|| CompatError::invalid("functions", "`functions` must be an array"))?
+                .iter()
+                .map(|function| serde_json::json!({"type": "function", "function": function})),
+        );
+    }
+    if !request.contains_key("tools") && !request.contains_key("functions") {
         return Ok(());
-    };
+    }
 
     let translated = tools
         .iter()
         .enumerate()
-        .map(|(index, tool)| {
-            let tool = tool.as_object().ok_or_else(|| {
-                CompatError::invalid(format!("tools[{index}]"), "Tools must be objects")
-            })?;
-            match tool.get("type").and_then(Value::as_str) {
-                Some("function") => {
-                    let function =
-                        tool.get("function")
-                            .and_then(Value::as_object)
-                            .ok_or_else(|| {
-                                CompatError::invalid(
-                                    format!("tools[{index}].function"),
-                                    "Function tools require `function`",
-                                )
-                            })?;
-                    let mut output = function.clone();
-                    output.insert("type".to_string(), Value::String("function".to_string()));
-                    Ok(Value::Object(output))
-                }
-                Some(kind) => Err(CompatError::unsupported(format!(
-                    "tools[{index}].type={kind}"
-                ))),
-                None => Err(CompatError::invalid(
-                    format!("tools[{index}].type"),
-                    "Tools require `type`",
-                )),
-            }
-        })
+        .map(|(index, tool)| translate_tool_definition(tool, &format!("tools[{index}]")))
         .collect::<Result<Vec<_>, _>>()?;
     responses.insert("tools".to_string(), Value::Array(translated));
     Ok(())
+}
+
+fn translate_tool_definition(tool: &Value, path: &str) -> Result<Value, CompatError> {
+    let tool = tool
+        .as_object()
+        .ok_or_else(|| CompatError::invalid(path, "Tools must be objects"))?;
+    match tool.get("type").and_then(Value::as_str) {
+        Some("function") => {
+            let function = tool
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CompatError::invalid(
+                        format!("{path}.function"),
+                        "Function tools require `function`",
+                    )
+                })?;
+            let mut output = function.clone();
+            output.insert("type".to_string(), Value::String("function".to_string()));
+            Ok(Value::Object(output))
+        }
+        Some("custom") => {
+            let custom = tool
+                .get("custom")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    CompatError::invalid(format!("{path}.custom"), "Custom tools require `custom`")
+                })?;
+            let mut output = custom.clone();
+            if let Some(format) = output.get_mut("format").and_then(Value::as_object_mut)
+                && format.get("type").and_then(Value::as_str) == Some("grammar")
+            {
+                let grammar = format
+                    .remove("grammar")
+                    .and_then(|value| value.as_object().cloned())
+                    .ok_or_else(|| {
+                        CompatError::invalid(
+                            format!("{path}.custom.format.grammar"),
+                            "Grammar formats require `grammar`",
+                        )
+                    })?;
+                format.extend(grammar);
+            }
+            output.insert("type".to_string(), Value::String("custom".to_string()));
+            Ok(Value::Object(output))
+        }
+        Some(kind) => Err(CompatError::unsupported(format!("{path}.type={kind}"))),
+        None => Err(CompatError::invalid(
+            format!("{path}.type"),
+            "Tools require `type`",
+        )),
+    }
 }
 
 fn translate_tool_choice(
     request: &Map<String, Value>,
     responses: &mut Map<String, Value>,
 ) -> Result<(), CompatError> {
+    if request.contains_key("tool_choice") && request.contains_key("function_call") {
+        return Err(CompatError::invalid(
+            "tool_choice",
+            "`tool_choice` and deprecated `function_call` cannot be used together",
+        ));
+    }
     let choice = request
         .get("tool_choice")
         .or_else(|| request.get("function_call"));
@@ -641,20 +915,47 @@ fn translate_tool_choice(
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("function");
-            if kind != "function" {
+            if kind == "allowed_tools" {
+                let allowed = choice
+                    .get("allowed_tools")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        CompatError::invalid(
+                            "tool_choice.allowed_tools",
+                            "Allowed tool choice requires `allowed_tools`",
+                        )
+                    })?;
+                let mode = required_string(allowed, "mode", "tool_choice.allowed_tools")?;
+                let tools = allowed
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        CompatError::invalid(
+                            "tool_choice.allowed_tools.tools",
+                            "Allowed tool choice requires a `tools` array",
+                        )
+                    })?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| {
+                        translate_tool_definition(
+                            tool,
+                            &format!("tool_choice.allowed_tools.tools[{index}]"),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                serde_json::json!({"type": "allowed_tools", "mode": mode, "tools": tools})
+            } else if kind == "function" || kind == "custom" {
+                let field = kind;
+                let selected = choice
+                    .get(field)
+                    .and_then(Value::as_object)
+                    .unwrap_or(choice);
+                let name = required_string(selected, "name", &format!("tool_choice.{field}"))?;
+                serde_json::json!({"type": kind, "name": name})
+            } else {
                 return Err(CompatError::unsupported("tool_choice.type"));
             }
-            let function = choice
-                .get("function")
-                .and_then(Value::as_object)
-                .unwrap_or(choice);
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    CompatError::invalid("tool_choice.function.name", "Tool choice requires `name`")
-                })?;
-            serde_json::json!({"type": "function", "name": name})
         }
         _ => {
             return Err(CompatError::invalid(
@@ -834,6 +1135,9 @@ struct StreamTranslator {
     id: String,
     created: i64,
     model: String,
+    service_tier: Option<Value>,
+    system_fingerprint: Option<Value>,
+    obfuscation: Option<String>,
     role_sent: bool,
     tool_calls: HashMap<u64, usize>,
     next_tool_index: usize,
@@ -847,6 +1151,9 @@ impl StreamTranslator {
             id: "chatcmpl-pending".to_string(),
             created: unix_timestamp(),
             model,
+            service_tier: None,
+            system_fingerprint: None,
+            obfuscation: None,
             role_sent: false,
             tool_calls: HashMap::new(),
             next_tool_index: 0,
@@ -857,6 +1164,10 @@ impl StreamTranslator {
 
     fn translate_event(&mut self, event: &Value) -> Vec<Bytes> {
         let mut frames = Vec::new();
+        self.obfuscation = event
+            .get("obfuscation")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         match event.get("type").and_then(Value::as_str) {
             Some("response.created") => {
                 if let Some(response) = event.get("response") {
@@ -878,7 +1189,8 @@ impl StreamTranslator {
             }
             Some("response.output_item.added") => {
                 let item = event.get("item").unwrap_or(&Value::Null);
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let item_type = item.get("type").and_then(Value::as_str);
+                if matches!(item_type, Some("function_call" | "custom_tool_call")) {
                     self.push_role(&mut frames);
                     let output_index = event
                         .get("output_index")
@@ -893,7 +1205,16 @@ impl StreamTranslator {
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                    frames.push(self.chunk(
+                    let delta = if item_type == Some("custom_tool_call") {
+                        serde_json::json!({
+                            "tool_calls": [{
+                                "index": tool_index,
+                                "id": call_id,
+                                "type": "custom",
+                                "custom": {"name": name, "input": ""},
+                            }]
+                        })
+                    } else {
                         serde_json::json!({
                             "tool_calls": [{
                                 "index": tool_index,
@@ -901,9 +1222,9 @@ impl StreamTranslator {
                                 "type": "function",
                                 "function": {"name": name, "arguments": ""},
                             }]
-                        }),
-                        None,
-                    ));
+                        })
+                    };
+                    frames.push(self.chunk(delta, None));
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -925,12 +1246,31 @@ impl StreamTranslator {
                     ));
                 }
             }
+            Some("response.custom_tool_call_input.delta") => {
+                self.push_role(&mut frames);
+                let output_index = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let tool_index = self.tool_calls.get(&output_index).copied().unwrap_or(0);
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    frames.push(self.chunk(
+                        serde_json::json!({
+                            "tool_calls": [{
+                                "index": tool_index,
+                                "custom": {"input": delta},
+                            }]
+                        }),
+                        None,
+                    ));
+                }
+            }
             Some("response.completed" | "response.incomplete") => {
                 let response = event.get("response").unwrap_or(&Value::Null);
                 self.update_metadata(response);
                 self.push_role(&mut frames);
                 let finish_reason = finish_reason(response, !self.tool_calls.is_empty());
-                frames.push(self.chunk(serde_json::json!({}), Some(finish_reason)));
+                frames.push(self.terminal_chunk(response, finish_reason));
                 if self.include_usage {
                     frames.push(self.usage_chunk(response.get("usage")));
                 }
@@ -964,6 +1304,18 @@ impl StreamTranslator {
         if let Some(model) = response.get("model").and_then(Value::as_str) {
             self.model = model.to_string();
         }
+        if let Some(service_tier) = response
+            .get("service_tier")
+            .filter(|value| !value.is_null())
+        {
+            self.service_tier = Some(service_tier.clone());
+        }
+        if let Some(system_fingerprint) = response
+            .get("system_fingerprint")
+            .filter(|value| !value.is_null())
+        {
+            self.system_fingerprint = Some(system_fingerprint.clone());
+        }
         if let Some(created) = response.get("created_at").and_then(|value| {
             value
                 .as_i64()
@@ -985,7 +1337,11 @@ impl StreamTranslator {
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> Bytes {
-        sse_json(&serde_json::json!({
+        sse_json(&self.chunk_value(delta, finish_reason))
+    }
+
+    fn chunk_value(&self, delta: Value, finish_reason: Option<&str>) -> Value {
+        let mut chunk = serde_json::json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "created": self.created,
@@ -996,18 +1352,35 @@ impl StreamTranslator {
                 "logprobs": null,
                 "finish_reason": finish_reason,
             }],
-        }))
+        });
+        if self.include_usage {
+            chunk["usage"] = Value::Null;
+        }
+        if let Some(service_tier) = self.service_tier.as_ref() {
+            chunk["service_tier"] = service_tier.clone();
+        }
+        if let Some(system_fingerprint) = self.system_fingerprint.as_ref() {
+            chunk["system_fingerprint"] = system_fingerprint.clone();
+        }
+        if let Some(obfuscation) = self.obfuscation.as_ref() {
+            chunk["obfuscation"] = Value::String(obfuscation.clone());
+        }
+        chunk
+    }
+
+    fn terminal_chunk(&self, response: &Value, finish_reason: &str) -> Bytes {
+        let mut chunk = self.chunk_value(serde_json::json!({}), Some(finish_reason));
+        if let Some(moderation) = response.get("moderation").filter(|value| !value.is_null()) {
+            chunk["moderation"] = moderation.clone();
+        }
+        sse_json(&chunk)
     }
 
     fn usage_chunk(&self, usage: Option<&Value>) -> Bytes {
-        sse_json(&serde_json::json!({
-            "id": self.id,
-            "object": "chat.completion.chunk",
-            "created": self.created,
-            "model": self.model,
-            "choices": [],
-            "usage": chat_usage(usage),
-        }))
+        let mut chunk = self.chunk_value(serde_json::json!({}), None);
+        chunk["choices"] = Value::Array(Vec::new());
+        chunk["usage"] = chat_usage(usage);
+        sse_json(&chunk)
     }
 }
 
@@ -1048,6 +1421,16 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
                         },
                     }));
                 }
+                Some("custom_tool_call") => {
+                    tool_calls.push(serde_json::json!({
+                        "id": item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or(""),
+                        "type": "custom",
+                        "custom": {
+                            "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                            "input": item.get("input").and_then(Value::as_str).unwrap_or(""),
+                        },
+                    }));
+                }
                 _ => {}
             }
         }
@@ -1056,7 +1439,7 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
     message.insert("role".to_string(), Value::String("assistant".to_string()));
     message.insert(
         "content".to_string(),
-        if content.is_empty() && !tool_calls.is_empty() {
+        if content.is_empty() && (!tool_calls.is_empty() || !refusal.is_empty()) {
             Value::Null
         } else {
             Value::String(content)
@@ -1085,7 +1468,7 @@ fn completion_from_response(response: &Value, request_model: &str) -> Value {
         }],
         "usage": chat_usage(response.get("usage")),
     });
-    for field in ["service_tier", "system_fingerprint"] {
+    for field in ["moderation", "service_tier", "system_fingerprint"] {
         if let Some(value) = response.get(field).filter(|value| !value.is_null()) {
             completion[field] = value.clone();
         }
