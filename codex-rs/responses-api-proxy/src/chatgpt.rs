@@ -25,6 +25,8 @@ use codex_login::CodexAuth;
 use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider::auth_provider_from_auth;
 use serde::Serialize;
+use serde_json::Map;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::Args;
@@ -379,10 +381,10 @@ pub(crate) async fn authenticated_request(
 }
 
 fn normalize_create_body(route: &ResponsesRoute, body: Bytes) -> Bytes {
-    if !route.is_create() {
+    if !route.accepts_response_input() {
         return body;
     }
-    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+    let Ok(mut payload) = serde_json::from_slice::<Value>(&body) else {
         return body;
     };
     let Some(payload_object) = payload.as_object_mut() else {
@@ -390,16 +392,42 @@ fn normalize_create_body(route: &ResponsesRoute, body: Bytes) -> Bytes {
     };
 
     let mut changed = false;
-    payload_object.entry("store").or_insert_with(|| {
-        changed = true;
-        serde_json::Value::Bool(false)
-    });
-    let input = payload_object.entry("input").or_insert_with(|| {
-        changed = true;
-        serde_json::Value::Array(Vec::new())
-    });
-    changed |= match input {
-        serde_json::Value::String(_) => {
+    if route.is_create() {
+        payload_object.entry("store").or_insert_with(|| {
+            changed = true;
+            Value::Bool(false)
+        });
+    }
+    changed |= normalize_array_field(payload_object, "context_management");
+    changed |= normalize_array_field(payload_object, "include");
+    changed |= normalize_tools_field(payload_object, "tools");
+    if let Some(tool_choice) = payload_object
+        .get_mut("tool_choice")
+        .and_then(Value::as_object_mut)
+        && tool_choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
+    {
+        changed |= normalize_array_field(tool_choice, "tools");
+    }
+
+    if route.is_create() {
+        let input = payload_object.entry("input").or_insert_with(|| {
+            changed = true;
+            Value::Array(Vec::new())
+        });
+        changed |= normalize_response_input_collections(input);
+    } else if let Some(input) = payload_object.get_mut("input") {
+        changed |= normalize_response_input_collections(input);
+    }
+
+    if !changed {
+        return body;
+    }
+    serde_json::to_vec(&payload).map_or(body, Bytes::from)
+}
+
+fn normalize_response_input_collections(input: &mut Value) -> bool {
+    let mut changed = match input {
+        Value::String(_) => {
             let text = input.take();
             *input = serde_json::json!([{
                 "type": "message",
@@ -408,48 +436,311 @@ fn normalize_create_body(route: &ResponsesRoute, body: Bytes) -> Bytes {
             }]);
             true
         }
-        serde_json::Value::Array(items) => {
-            let mut changed = false;
-            for item in items {
-                changed |= normalize_easy_message(item);
-            }
-            changed
-        }
-        serde_json::Value::Null => {
-            *input = serde_json::Value::Array(Vec::new());
+        Value::Array(_) => false,
+        Value::Null => {
+            *input = Value::Array(Vec::new());
             true
         }
-        _ => false,
+        _ => {
+            let item = input.take();
+            *input = Value::Array(vec![item]);
+            true
+        }
     };
-
-    if !changed {
-        return body;
+    if let Value::Array(items) = input {
+        for item in items {
+            changed |= normalize_response_item_collections(item);
+        }
     }
-    serde_json::to_vec(&payload).map_or(body, Bytes::from)
+    changed
 }
 
-fn normalize_easy_message(item: &mut serde_json::Value) -> bool {
+pub(crate) fn normalize_response_item_collections(item: &mut Value) -> bool {
     let Some(message) = item.as_object_mut() else {
         return false;
     };
-    if !message.contains_key("role") {
-        return false;
+    let item_type = message
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut changed = false;
+
+    if item_type.as_deref() == Some("message") || message.contains_key("role") {
+        message
+            .entry("type")
+            .or_insert_with(|| Value::String("message".to_string()));
+        changed |= normalize_message_content(message);
     }
-    let Some(serde_json::Value::String(_)) = message.get("content") else {
+
+    match item_type.as_deref() {
+        Some("reasoning") => {
+            changed |= normalize_array_field(message, "summary");
+            changed |= normalize_array_field(message, "content");
+        }
+        Some("file_search_call") => {
+            changed |= normalize_array_field(message, "queries");
+            changed |= normalize_array_field(message, "results");
+        }
+        Some("computer_call") => {
+            changed |= normalize_array_field(message, "pending_safety_checks");
+            changed |= normalize_computer_actions(message);
+        }
+        Some("computer_call_output") => {
+            changed |= normalize_array_field(message, "acknowledged_safety_checks");
+        }
+        Some("web_search_call") => {
+            if let Some(action) = message.get_mut("action").and_then(Value::as_object_mut) {
+                changed |= normalize_array_field(action, "queries");
+                changed |= normalize_array_field(action, "sources");
+            }
+        }
+        Some("code_interpreter_call") => {
+            changed |= normalize_array_field(message, "outputs");
+        }
+        Some("local_shell_call") => {
+            if let Some(action) = message.get_mut("action").and_then(Value::as_object_mut) {
+                changed |= normalize_array_field(action, "command");
+            }
+        }
+        Some("shell_call") => {
+            if let Some(action) = message.get_mut("action").and_then(Value::as_object_mut) {
+                changed |= normalize_array_field(action, "commands");
+            }
+        }
+        Some("shell_call_output") => {
+            changed |= normalize_array_field(message, "output");
+        }
+        Some("additional_tools" | "tool_search_output") => {
+            changed |= normalize_tools_field(message, "tools");
+        }
+        Some("mcp_list_tools") => {
+            // MCP tool annotations are arbitrary objects, unlike output_text
+            // annotations. Only the outer tool collection is normalized here.
+            changed |= normalize_array_field(message, "tools");
+        }
+        Some("function_call_output" | "custom_tool_call_output") => {
+            changed |= normalize_string_or_array_field(message, "output");
+        }
+        _ => {}
+    }
+
+    changed
+}
+
+fn normalize_message_content(message: &mut Map<String, Value>) -> bool {
+    let role_is_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
+    let Some(content) = message.get_mut("content") else {
         return false;
     };
+    let mut changed = match content {
+        Value::String(_) => {
+            let text = content.take();
+            let content_type = if role_is_assistant {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            *content = serde_json::json!([{ "type": content_type, "text": text }]);
+            true
+        }
+        Value::Array(_) => false,
+        Value::Null => {
+            *content = Value::Array(Vec::new());
+            true
+        }
+        _ => {
+            let part = content.take();
+            *content = Value::Array(vec![part]);
+            true
+        }
+    };
 
-    let text = message
-        .get_mut("content")
-        .map(serde_json::Value::take)
-        .unwrap_or(serde_json::Value::Null);
-    message
-        .entry("type")
-        .or_insert_with(|| serde_json::Value::String("message".to_string()));
-    message.insert(
-        "content".to_string(),
-        serde_json::json!([{"type": "input_text", "text": text}]),
-    );
+    if let Value::Array(parts) = content {
+        for part in parts {
+            changed |= normalize_content_part_collections(part);
+        }
+    }
+    changed
+}
+
+fn normalize_content_part_collections(part: &mut Value) -> bool {
+    let Some(part) = part.as_object_mut() else {
+        return false;
+    };
+    let mut changed = normalize_array_field(part, "annotations");
+    changed |= normalize_array_field(part, "logprobs");
+    if let Some(logprobs) = part.get_mut("logprobs").and_then(Value::as_array_mut) {
+        for logprob in logprobs {
+            changed |= normalize_logprob_collections(logprob);
+        }
+    }
+    changed
+}
+
+fn normalize_logprob_collections(logprob: &mut Value) -> bool {
+    let Some(logprob) = logprob.as_object_mut() else {
+        return false;
+    };
+    let mut changed = normalize_array_field(logprob, "bytes");
+    changed |= normalize_array_field(logprob, "top_logprobs");
+    if let Some(top_logprobs) = logprob
+        .get_mut("top_logprobs")
+        .and_then(Value::as_array_mut)
+    {
+        for top_logprob in top_logprobs {
+            if let Some(top_logprob) = top_logprob.as_object_mut() {
+                changed |= normalize_array_field(top_logprob, "bytes");
+            }
+        }
+    }
+    changed
+}
+
+fn normalize_computer_actions(item: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    if let Some(action) = item.get_mut("action").and_then(Value::as_object_mut) {
+        changed |= normalize_computer_action(action);
+    }
+    changed |= normalize_array_field(item, "actions");
+    if let Some(actions) = item.get_mut("actions").and_then(Value::as_array_mut) {
+        for action in actions {
+            if let Some(action) = action.as_object_mut() {
+                changed |= normalize_computer_action(action);
+            }
+        }
+    }
+    changed
+}
+
+fn normalize_computer_action(action: &mut Map<String, Value>) -> bool {
+    let mut changed = normalize_array_field(action, "keys");
+    if action.get("type").and_then(Value::as_str) == Some("drag") {
+        changed |= normalize_array_field(action, "path");
+    }
+    changed
+}
+
+fn normalize_tools_field(object: &mut Map<String, Value>, field: &str) -> bool {
+    let mut changed = normalize_array_field(object, field);
+    if let Some(tools) = object.get_mut(field).and_then(Value::as_array_mut) {
+        for tool in tools {
+            changed |= normalize_tool_collections(tool);
+        }
+    }
+    changed
+}
+
+fn normalize_tool_collections(tool: &mut Value) -> bool {
+    let Some(tool) = tool.as_object_mut() else {
+        return false;
+    };
+    let tool_type = tool.get("type").and_then(Value::as_str).map(str::to_owned);
+    let mut changed = normalize_array_field(tool, "allowed_callers");
+
+    match tool_type.as_deref() {
+        Some("file_search") => {
+            changed |= normalize_array_field(tool, "vector_store_ids");
+        }
+        Some("namespace") => {
+            changed |= normalize_tools_field(tool, "tools");
+        }
+        Some("mcp") => {
+            if let Some(allowed_tools) = tool.get_mut("allowed_tools") {
+                match allowed_tools {
+                    Value::Object(filter) => {
+                        changed |= normalize_array_field(filter, "tool_names");
+                    }
+                    Value::Array(_) => {}
+                    Value::Null => {
+                        *allowed_tools = Value::Array(Vec::new());
+                        changed = true;
+                    }
+                    _ => {
+                        let allowed_tool = allowed_tools.take();
+                        *allowed_tools = Value::Array(vec![allowed_tool]);
+                        changed = true;
+                    }
+                }
+            }
+            if let Some(require_approval) = tool
+                .get_mut("require_approval")
+                .and_then(Value::as_object_mut)
+            {
+                for policy in ["always", "never"] {
+                    if let Some(filter) = require_approval
+                        .get_mut(policy)
+                        .and_then(Value::as_object_mut)
+                    {
+                        changed |= normalize_array_field(filter, "tool_names");
+                    }
+                }
+            }
+        }
+        Some("code_interpreter") => {
+            if let Some(container) = tool.get_mut("container").and_then(Value::as_object_mut) {
+                changed |= normalize_container_collections(container);
+            }
+        }
+        Some("shell") => {
+            if let Some(environment) = tool.get_mut("environment").and_then(Value::as_object_mut) {
+                changed |= normalize_container_collections(environment);
+            }
+        }
+        Some("web_search" | "web_search_preview" | "web_search_preview_2025_03_11") => {
+            changed |= normalize_array_field(tool, "search_content_types");
+            if let Some(filters) = tool.get_mut("filters").and_then(Value::as_object_mut) {
+                changed |= normalize_array_field(filters, "allowed_domains");
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+fn normalize_container_collections(container: &mut Map<String, Value>) -> bool {
+    let mut changed = normalize_array_field(container, "file_ids");
+    changed |= normalize_array_field(container, "skills");
+    if let Some(network_policy) = container
+        .get_mut("network_policy")
+        .and_then(Value::as_object_mut)
+    {
+        changed |= normalize_array_field(network_policy, "allowed_domains");
+        changed |= normalize_array_field(network_policy, "domain_secrets");
+    }
+    changed
+}
+
+fn normalize_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
+    let Some(value) = object.get_mut(field) else {
+        return false;
+    };
+    match value {
+        Value::Array(_) => false,
+        Value::Null => {
+            *value = Value::Array(Vec::new());
+            true
+        }
+        _ => {
+            let item = value.take();
+            *value = Value::Array(vec![item]);
+            true
+        }
+    }
+}
+
+fn normalize_string_or_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
+    let Some(value) = object.get_mut(field) else {
+        return false;
+    };
+    if matches!(value, Value::String(_) | Value::Array(_)) {
+        return false;
+    }
+    if value.is_null() {
+        *value = Value::Array(Vec::new());
+    } else {
+        let item = value.take();
+        *value = Value::Array(vec![item]);
+    }
     true
 }
 

@@ -101,14 +101,24 @@ The proxy exposes the complete REST resource documented in the
 
 Documented query parameters are forwarded for retrieve (`include`, `include_obfuscation`, and
 `starting_after`) and list input items (`after`, `include`, `limit`, and `order`). Request and
-response bodies remain opaque, so streaming and future body fields do not require proxy changes.
-Unsupported methods, paths, and query parameters are rejected with `403 Forbidden`.
+response fields not covered by compatibility rules remain opaque, so streaming and future fields
+pass through unchanged. Unsupported methods, paths, and query parameters are rejected with `403
+Forbidden`.
 
 The ChatGPT backend requires `input` to be an item list. In ChatGPT mode, the proxy accepts the
 public API's string and easy-message shorthand forms and expands them to equivalent `message` /
 `input_text` items before forwarding. It also supplies the backend-required `store: false` and an
 empty input list when those optional public-API fields are omitted. Explicit values and already
 structured item lists are preserved.
+
+For schema fields declared as collections, the compatibility layer also accepts a single value and
+wraps it in a one-element array; `null` becomes an empty array. This applies recursively to the
+documented request structures, including message `content`, output-text `annotations` and
+`logprobs`, reasoning content, tool definitions, search results, computer actions, and shell
+inputs/outputs. The coercion is path- and type-aware: arbitrary JSON objects such as function
+schemas, metadata, MCP tool annotations, and tool arguments are never rewritten merely because a
+property has the same name. Stored and replayed Conversation items use the same normalization, so
+older singleton-shaped history cannot produce an invalid upstream request.
 
 ## Conversations compatibility
 

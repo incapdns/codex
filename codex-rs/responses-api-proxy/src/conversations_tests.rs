@@ -184,6 +184,67 @@ async fn prepends_history_and_persists_response_items() {
 }
 
 #[tokio::test]
+async fn normalizes_single_conversation_items_and_replayed_output_annotations() {
+    let directory = TempDir::new().unwrap();
+    let store = ConversationStore::new_for_testing(directory.path().join("store.json"), 80).await;
+    let conversation = store
+        .create_conversation(
+            br#"{
+                "items": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": {
+                        "type": "output_text",
+                        "text": "previous",
+                        "annotations": {"type": "file_citation", "file_id": "file_1"}
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+    let conversation_id = conversation["id"].as_str().unwrap();
+
+    let stored = store
+        .list_items(
+            conversation_id,
+            ListQuery {
+                after: None,
+                limit: 20,
+                order: ListOrder::Asc,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(stored["data"][0]["content"].is_array());
+    assert!(stored["data"][0]["content"][0]["annotations"].is_array());
+
+    let request = serde_json::json!({
+        "model": "gpt-test",
+        "conversation": conversation_id,
+        "include": "file_search_call.results",
+        "input": {
+            "type": "message",
+            "role": "user",
+            "content": {"type": "input_text", "text": "next"}
+        }
+    });
+    let prepared = store
+        .begin_response(&serde_json::to_vec(&request).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let upstream: Value = serde_json::from_slice(&store.upstream_body(&prepared).unwrap()).unwrap();
+    assert_eq!(upstream["input"].as_array().unwrap().len(), 2);
+    assert!(upstream["input"][0]["content"][0]["annotations"].is_array());
+    assert!(upstream["input"][1]["content"].is_array());
+    assert_eq!(
+        upstream["include"],
+        serde_json::json!(["file_search_call.results", "reasoning.encrypted_content"])
+    );
+}
+
+#[tokio::test]
 async fn compacts_supported_models_and_uses_checkpoint_as_context() {
     let directory = TempDir::new().unwrap();
     let store = ConversationStore::new_for_testing(directory.path().join("store.json"), 1).await;

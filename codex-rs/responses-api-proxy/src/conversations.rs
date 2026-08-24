@@ -771,6 +771,7 @@ impl ConversationStore {
                 .collect::<HashSet<_>>();
             for value in output {
                 let mut value = value;
+                crate::chatgpt::normalize_response_item_collections(&mut value);
                 let generated_id = ensure_item_id(&mut value);
                 if let Some(id) = item_id(&value) {
                     if existing_ids.contains(id) {
@@ -1013,15 +1014,13 @@ fn normalize_response_input(value: Option<&Value>) -> Result<Vec<StoredItem>, Co
             "input",
         ),
         Some(Value::Array(items)) => normalize_item_values(items, "input"),
-        Some(_) => Err(ConversationError::invalid(
-            "input",
-            "`input` must be a string, array, or null",
-        )),
+        Some(item) => normalize_item_values(std::slice::from_ref(item), "input"),
     }
 }
 
 fn item_for_upstream(item: &StoredItem) -> Value {
     let mut value = item.value.clone();
+    crate::chatgpt::normalize_response_item_collections(&mut value);
     if item.generated_id
         && let Some(object) = value.as_object_mut()
     {
@@ -1052,11 +1051,16 @@ fn ensure_reasoning_encrypted_content(
                     include.push(Value::String("reasoning.encrypted_content".to_string()));
                 }
             }
-            _ => {
-                return Err(ConversationError::invalid(
-                    "include",
-                    "`include` must be an array or null",
-                ));
+            include => {
+                let value = include.take();
+                let mut values = vec![value];
+                if !values
+                    .iter()
+                    .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
+                {
+                    values.push(Value::String("reasoning.encrypted_content".to_string()));
+                }
+                *include = Value::Array(values);
             }
         },
     }
@@ -1294,9 +1298,15 @@ fn validate_metadata(value: Option<&Value>) -> Result<Value, ConversationError> 
 }
 
 fn normalize_items(value: &Value, param: &str) -> Result<Vec<StoredItem>, ConversationError> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| ConversationError::invalid(param, format!("`{param}` must be an array")))?;
+    let singleton;
+    let items = match value {
+        Value::Array(items) => items.as_slice(),
+        Value::Null => &[],
+        item => {
+            singleton = [item.clone()];
+            singleton.as_slice()
+        }
+    };
     if items.len() > MAX_ITEMS_PER_REQUEST {
         return Err(ConversationError::invalid(
             param,
@@ -1324,7 +1334,13 @@ fn normalize_item_values(
             if !item.contains_key("type") && item.contains_key("role") {
                 item.insert("type".to_string(), Value::String("message".to_string()));
             }
-            normalize_message_content(&mut item);
+            let mut value = Value::Object(item);
+            crate::chatgpt::normalize_response_item_collections(&mut value);
+            let Value::Object(mut item) = value else {
+                return Err(ConversationError::internal(
+                    "Normalized conversation item is not an object",
+                ));
+            };
             if item.get("type").and_then(Value::as_str) == Some("message") {
                 item.entry("status")
                     .or_insert_with(|| Value::String("completed".to_string()));
@@ -1352,26 +1368,6 @@ fn normalize_item_values(
             })
         })
         .collect()
-}
-
-fn normalize_message_content(item: &mut Map<String, Value>) {
-    if item.get("type").and_then(Value::as_str) != Some("message") {
-        return;
-    }
-    let role_is_assistant = item.get("role").and_then(Value::as_str) == Some("assistant");
-    let Some(Value::String(text)) = item.get_mut("content") else {
-        return;
-    };
-    let text = std::mem::take(text);
-    let content_type = if role_is_assistant {
-        "output_text"
-    } else {
-        "input_text"
-    };
-    item.insert(
-        "content".to_string(),
-        serde_json::json!([{"type": content_type, "text": text}]),
-    );
 }
 
 fn ensure_unique_item_ids(

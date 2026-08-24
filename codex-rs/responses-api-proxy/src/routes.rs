@@ -17,6 +17,12 @@ impl ResponsesRoute {
         self.method == Method::POST && self.suffix.is_empty()
     }
 
+    pub(crate) fn accepts_response_input(&self) -> bool {
+        self.method == Method::POST
+            && (self.suffix.is_empty()
+                || matches!(self.suffix.as_slice(), [suffix] if suffix == "compact" || suffix == "input_tokens"))
+    }
+
     pub(crate) fn upstream_url(&self, create_url: &Url) -> Result<Url> {
         validate_upstream_create_url(create_url)?;
 

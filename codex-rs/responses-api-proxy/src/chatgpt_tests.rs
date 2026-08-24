@@ -152,6 +152,180 @@ fn normalizes_easy_message_content_but_preserves_structured_input() {
     );
 }
 
+#[test]
+fn normalizes_singletons_for_schema_declared_response_collections() {
+    let route = resolve_responses_route("POST", "/v1/responses").unwrap();
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-test",
+            "context_management": {"type": "compaction"},
+            "include": "reasoning.encrypted_content",
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": {"type": "function", "name": "selected"}
+            },
+            "tools": {
+                "type": "namespace",
+                "name": "demo",
+                "description": "demo",
+                "allowed_callers": "direct",
+                "tools": {
+                    "type": "file_search",
+                    "vector_store_ids": "vs_1"
+                }
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": {
+                        "type": "output_text",
+                        "text": "answer",
+                        "annotations": {"type": "file_citation", "file_id": "file_1"},
+                        "logprobs": {
+                            "token": "a",
+                            "bytes": 97,
+                            "top_logprobs": {"token": "b", "bytes": 98}
+                        }
+                    }
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": {"type": "summary_text", "text": "summary"},
+                    "content": {"type": "reasoning_text", "text": "detail"}
+                },
+                {
+                    "type": "file_search_call",
+                    "id": "fs_1",
+                    "queries": "needle",
+                    "results": {"file_id": "file_1"}
+                },
+                {
+                    "type": "computer_call",
+                    "id": "pc_1",
+                    "pending_safety_checks": {"id": "safe_1"},
+                    "action": {"type": "drag", "keys": "SHIFT", "path": {"x": 1, "y": 2}},
+                    "actions": {"type": "keypress", "keys": "ENTER"}
+                },
+                {
+                    "type": "computer_call_output",
+                    "call_id": "pc_1",
+                    "acknowledged_safety_checks": {"id": "safe_1"}
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "web_1",
+                    "action": {
+                        "type": "search",
+                        "queries": "query",
+                        "sources": {"type": "url", "url": "https://example.com"}
+                    }
+                },
+                {"type": "code_interpreter_call", "id": "ci_1", "outputs": {"type": "logs", "logs": "ok"}},
+                {"type": "local_shell_call", "id": "ls_1", "action": {"type": "exec", "command": "pwd"}},
+                {"type": "shell_call", "call_id": "sh_1", "action": {"commands": "pwd"}},
+                {"type": "shell_call_output", "call_id": "sh_1", "output": {"stdout": "ok", "stderr": ""}},
+                {
+                    "type": "tool_search_output",
+                    "tools": {
+                        "type": "mcp",
+                        "server_label": "demo",
+                        "allowed_tools": "read",
+                        "require_approval": {"always": {"tool_names": "write"}}
+                    }
+                },
+                {
+                    "type": "mcp_list_tools",
+                    "id": "mcp_1",
+                    "server_label": "demo",
+                    "tools": {
+                        "name": "read",
+                        "input_schema": {},
+                        "annotations": {"readOnlyHint": true}
+                    }
+                },
+                {"type": "function_call_output", "call_id": "fn_1", "output": {"type": "input_text", "text": "ok"}}
+            ]
+        }))
+        .unwrap(),
+    );
+
+    let normalized = super::normalize_create_body(&route, body);
+    let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+    assert!(value["context_management"].is_array());
+    assert!(value["include"].is_array());
+    assert!(value["tools"].is_array());
+    assert!(value["tools"][0]["allowed_callers"].is_array());
+    assert!(value["tools"][0]["tools"].is_array());
+    assert!(value["tools"][0]["tools"][0]["vector_store_ids"].is_array());
+    assert!(value["tool_choice"]["tools"].is_array());
+
+    let input = value["input"].as_array().unwrap();
+    let output_text = &input[0]["content"][0];
+    assert!(input[0]["content"].is_array());
+    assert!(output_text["annotations"].is_array());
+    assert!(output_text["logprobs"].is_array());
+    assert!(output_text["logprobs"][0]["bytes"].is_array());
+    assert!(output_text["logprobs"][0]["top_logprobs"].is_array());
+    assert!(output_text["logprobs"][0]["top_logprobs"][0]["bytes"].is_array());
+    assert!(input[1]["summary"].is_array());
+    assert!(input[1]["content"].is_array());
+    assert!(input[2]["queries"].is_array());
+    assert!(input[2]["results"].is_array());
+    assert!(input[3]["pending_safety_checks"].is_array());
+    assert!(input[3]["action"]["keys"].is_array());
+    assert!(input[3]["action"]["path"].is_array());
+    assert!(input[3]["actions"].is_array());
+    assert!(input[3]["actions"][0]["keys"].is_array());
+    assert!(input[4]["acknowledged_safety_checks"].is_array());
+    assert!(input[5]["action"]["queries"].is_array());
+    assert!(input[5]["action"]["sources"].is_array());
+    assert!(input[6]["outputs"].is_array());
+    assert!(input[7]["action"]["command"].is_array());
+    assert!(input[8]["action"]["commands"].is_array());
+    assert!(input[9]["output"].is_array());
+    assert!(input[10]["tools"].is_array());
+    assert!(input[10]["tools"][0]["allowed_tools"].is_array());
+    assert!(input[10]["tools"][0]["require_approval"]["always"]["tool_names"].is_array());
+    assert!(input[11]["tools"].is_array());
+    assert!(input[11]["tools"][0]["annotations"].is_object());
+    assert!(input[12]["output"].is_array());
+
+    let normalized_again = super::normalize_create_body(&route, normalized.clone());
+    assert_eq!(normalized_again, normalized);
+}
+
+#[test]
+fn wraps_a_single_structured_response_input_item() {
+    let route = resolve_responses_route("POST", "/v1/responses").unwrap();
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-test","input":{"type":"message","role":"user","content":{"type":"input_text","text":"hello"}}}"#,
+    );
+    let normalized = super::normalize_create_body(&route, body);
+    let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+    assert!(value["input"].is_array());
+    assert!(value["input"][0]["content"].is_array());
+}
+
+#[test]
+fn normalizes_collections_for_compact_and_input_token_requests_without_adding_store() {
+    for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
+        let route = resolve_responses_route("POST", path).unwrap();
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-test","input":{"type":"message","role":"user","content":{"type":"input_text","text":"hello"}},"tools":{"type":"file_search","vector_store_ids":"vs_1"}}"#,
+        );
+        let normalized = super::normalize_create_body(&route, body);
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+        assert!(value.get("store").is_none());
+        assert!(value["input"].is_array());
+        assert!(value["input"][0]["content"].is_array());
+        assert!(value["tools"].is_array());
+        assert!(value["tools"][0]["vector_store_ids"].is_array());
+    }
+}
+
 #[tokio::test]
 async fn forwards_every_supported_responses_operation() {
     let server = MockServer::start().await;
