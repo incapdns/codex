@@ -120,6 +120,11 @@ schemas, metadata, MCP tool annotations, and tool arguments are never rewritten 
 property has the same name. Stored and replayed Conversation items use the same normalization, so
 older singleton-shaped history cannot produce an invalid upstream request.
 
+Output-text annotations receive additional schema validation because every official annotation
+requires a string `type` discriminator. A typed singleton is wrapped, maps of typed annotations are
+flattened, and empty or untyped client metadata is omitted instead of being forwarded as an invalid
+annotation such as `[{}]`.
+
 ## Conversations compatibility
 
 The ChatGPT Codex backend does not expose the public Conversations resource. In ChatGPT auth mode,

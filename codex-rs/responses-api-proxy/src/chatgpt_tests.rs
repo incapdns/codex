@@ -310,6 +310,54 @@ fn wraps_a_single_structured_response_input_item() {
 }
 
 #[test]
+fn keeps_only_typed_output_text_annotations() {
+    let route = resolve_responses_route("POST", "/v1/responses").unwrap();
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-test",
+            "input": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "empty", "annotations": {}},
+                    {
+                        "type": "output_text",
+                        "text": "mapped",
+                        "annotations": {
+                            "citation": {"type": "file_citation", "file_id": "file_1"},
+                            "metadata": {"source": "client"}
+                        }
+                    },
+                    {
+                        "type": "output_text",
+                        "text": "mixed",
+                        "annotations": [
+                            {},
+                            {"type": "url_citation", "url": "https://example.com"},
+                            "invalid"
+                        ]
+                    }
+                ]
+            }]
+        }))
+        .unwrap(),
+    );
+
+    let normalized = super::normalize_create_body(&route, body);
+    let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+    let content = value["input"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["annotations"], serde_json::json!([]));
+    assert_eq!(
+        content[1]["annotations"],
+        serde_json::json!([{"type": "file_citation", "file_id": "file_1"}])
+    );
+    assert_eq!(
+        content[2]["annotations"],
+        serde_json::json!([{"type": "url_citation", "url": "https://example.com"}])
+    );
+}
+
+#[test]
 fn normalizes_collections_for_compact_and_input_token_requests_without_adding_store() {
     for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
         let route = resolve_responses_route("POST", path).unwrap();

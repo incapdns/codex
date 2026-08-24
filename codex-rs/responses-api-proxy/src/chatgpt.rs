@@ -567,7 +567,7 @@ fn normalize_content_part_collections(part: &mut Value) -> bool {
     let Some(part) = part.as_object_mut() else {
         return false;
     };
-    let mut changed = normalize_array_field(part, "annotations");
+    let mut changed = normalize_annotation_collection(part);
     changed |= normalize_array_field(part, "logprobs");
     if let Some(logprobs) = part.get_mut("logprobs").and_then(Value::as_array_mut) {
         for logprob in logprobs {
@@ -575,6 +575,45 @@ fn normalize_content_part_collections(part: &mut Value) -> bool {
         }
     }
     changed
+}
+
+fn normalize_annotation_collection(content: &mut Map<String, Value>) -> bool {
+    let Some(annotations) = content.get_mut("annotations") else {
+        return false;
+    };
+
+    match annotations {
+        Value::Array(values) => {
+            let original_len = values.len();
+            values.retain(is_typed_annotation);
+            values.len() != original_len
+        }
+        Value::Object(annotation) if has_string_type(annotation) => {
+            let annotation = annotations.take();
+            *annotations = Value::Array(vec![annotation]);
+            true
+        }
+        Value::Object(annotation_map) => {
+            let values = std::mem::take(annotation_map)
+                .into_values()
+                .filter(is_typed_annotation)
+                .collect();
+            *annotations = Value::Array(values);
+            true
+        }
+        _ => {
+            *annotations = Value::Array(Vec::new());
+            true
+        }
+    }
+}
+
+fn is_typed_annotation(annotation: &Value) -> bool {
+    annotation.as_object().is_some_and(has_string_type)
+}
+
+fn has_string_type(annotation: &Map<String, Value>) -> bool {
+    annotation.get("type").and_then(Value::as_str).is_some()
 }
 
 fn normalize_logprob_collections(logprob: &mut Value) -> bool {
