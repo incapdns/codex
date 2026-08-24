@@ -474,8 +474,8 @@ pub(crate) fn normalize_response_item_collections(item: &mut Value) -> bool {
 
     match item_type.as_deref() {
         Some("reasoning") => {
-            changed |= normalize_array_field(message, "summary");
-            changed |= normalize_array_field(message, "content");
+            changed |= normalize_typed_text_collection(message, "summary", "summary_text");
+            changed |= normalize_typed_text_collection(message, "content", "reasoning_text");
         }
         Some("file_search_call") => {
             changed |= normalize_array_field(message, "queries");
@@ -532,35 +532,68 @@ fn normalize_message_content(message: &mut Map<String, Value>) -> bool {
     let Some(content) = message.get_mut("content") else {
         return false;
     };
-    let mut changed = match content {
-        Value::String(_) => {
-            let text = content.take();
-            let content_type = if role_is_assistant {
-                "output_text"
-            } else {
-                "input_text"
-            };
-            *content = serde_json::json!([{ "type": content_type, "text": text }]);
-            true
+    let original = content.clone();
+    let candidates = match content.take() {
+        Value::Array(values) => values,
+        Value::Object(values) => {
+            let direct =
+                normalize_message_content_part(Value::Object(values.clone()), role_is_assistant);
+            match direct {
+                Some(value) => vec![value],
+                None => values.into_values().collect(),
+            }
         }
-        Value::Array(_) => false,
-        Value::Null => {
-            *content = Value::Array(Vec::new());
-            true
-        }
-        _ => {
-            let part = content.take();
-            *content = Value::Array(vec![part]);
-            true
-        }
+        Value::Null => Vec::new(),
+        value => vec![value],
     };
-
-    if let Value::Array(parts) = content {
-        for part in parts {
-            changed |= normalize_content_part_collections(part);
-        }
+    let mut parts = candidates
+        .into_iter()
+        .filter_map(|part| normalize_message_content_part(part, role_is_assistant))
+        .collect::<Vec<_>>();
+    let mut changed = Value::Array(parts.clone()) != original;
+    for part in &mut parts {
+        changed |= normalize_content_part_collections(part);
     }
+    *content = Value::Array(parts);
     changed
+}
+
+fn normalize_message_content_part(mut part: Value, role_is_assistant: bool) -> Option<Value> {
+    if let Value::String(text) = part {
+        let content_type = if role_is_assistant {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        return Some(serde_json::json!({"type": content_type, "text": text}));
+    }
+    let part_object = part.as_object_mut()?;
+    match part_object.get("type") {
+        Some(Value::String(_)) => return Some(part),
+        Some(value) if !value.is_null() => return None,
+        _ => {}
+    }
+
+    let inferred_type = if part_object.get("text").and_then(Value::as_str).is_some() {
+        if role_is_assistant {
+            "output_text"
+        } else {
+            "input_text"
+        }
+    } else if part_object.contains_key("image_url") {
+        "input_image"
+    } else if ["file_data", "file_id", "file_url", "filename"]
+        .iter()
+        .any(|field| part_object.contains_key(*field))
+    {
+        "input_file"
+    } else if part_object.contains_key("input_audio") || part_object.contains_key("audio_url") {
+        "input_audio"
+    } else {
+        return None;
+    };
+    part_object.insert("type".to_string(), Value::String(inferred_type.to_string()));
+    Some(part)
 }
 
 fn normalize_content_part_collections(part: &mut Value) -> bool {
@@ -614,6 +647,66 @@ fn is_typed_annotation(annotation: &Value) -> bool {
 
 fn has_string_type(annotation: &Map<String, Value>) -> bool {
     annotation.get("type").and_then(Value::as_str).is_some()
+}
+
+fn normalize_typed_text_collection(
+    object: &mut Map<String, Value>,
+    field: &str,
+    expected_type: &'static str,
+) -> bool {
+    let Some(value) = object.get_mut(field) else {
+        return false;
+    };
+    let original = value.clone();
+    let values = match value.take() {
+        Value::Array(values) => values
+            .into_iter()
+            .filter_map(|value| normalize_typed_text_part(value, expected_type))
+            .collect(),
+        Value::Object(values) => {
+            let direct = normalize_typed_text_part(Value::Object(values.clone()), expected_type);
+            match direct {
+                Some(value) => vec![value],
+                None => values
+                    .into_values()
+                    .filter_map(|value| normalize_typed_text_part(value, expected_type))
+                    .collect(),
+            }
+        }
+        Value::String(text) => vec![serde_json::json!({
+            "type": expected_type,
+            "text": text,
+        })],
+        _ => Vec::new(),
+    };
+    *value = Value::Array(values);
+    *value != original
+}
+
+fn normalize_typed_text_part(value: Value, expected_type: &'static str) -> Option<Value> {
+    match value {
+        Value::String(text) => Some(serde_json::json!({
+            "type": expected_type,
+            "text": text,
+        })),
+        Value::Object(mut part)
+            if part.get("text").and_then(Value::as_str).is_some()
+                && matches!(
+                    part.get("type"),
+                    None | Some(Value::Null) | Some(Value::String(_))
+                ) =>
+        {
+            match part.get("type").and_then(Value::as_str) {
+                Some(actual_type) if actual_type != expected_type => return None,
+                Some(_) => {}
+                None => {
+                    part.insert("type".to_string(), Value::String(expected_type.to_string()));
+                }
+            }
+            Some(Value::Object(part))
+        }
+        _ => None,
+    }
 }
 
 fn normalize_logprob_collections(logprob: &mut Value) -> bool {
@@ -756,6 +849,10 @@ fn normalize_array_field(object: &mut Map<String, Value>, field: &str) -> bool {
     match value {
         Value::Array(_) => false,
         Value::Null => {
+            *value = Value::Array(Vec::new());
+            true
+        }
+        Value::Object(object) if object.is_empty() => {
             *value = Value::Array(Vec::new());
             true
         }

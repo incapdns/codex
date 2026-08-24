@@ -125,6 +125,14 @@ requires a string `type` discriminator. A typed singleton is wrapped, maps of ty
 flattened, and empty or untyped client metadata is omitted instead of being forwarded as an invalid
 annotation such as `[{}]`.
 
+Reasoning collections are normalized by their fixed public discriminators as well. A summary text
+object or string becomes a `summary_text` item, reasoning content becomes a `reasoning_text` item,
+and empty, unrecognized, or incorrectly discriminated entries are omitted.
+
+Message content receives the equivalent treatment: text, image, file, and audio objects with an
+unambiguous payload receive their public content-part discriminator, while empty or unrecognized
+objects are omitted rather than forwarded as an invalid content item.
+
 ## Conversations compatibility
 
 The ChatGPT Codex backend does not expose the public Conversations resource. In ChatGPT auth mode,

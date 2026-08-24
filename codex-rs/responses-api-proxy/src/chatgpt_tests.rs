@@ -358,6 +358,107 @@ fn keeps_only_typed_output_text_annotations() {
 }
 
 #[test]
+fn normalizes_reasoning_summary_and_content_discriminators() {
+    let route = resolve_responses_route("POST", "/v1/responses").unwrap();
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-test",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": {"text": "summary"},
+                    "content": "reasoning"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": {},
+                    "content": {
+                        "first": {"text": "first"},
+                        "invalid": {"metadata": true}
+                    }
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_3",
+                    "summary": [
+                        {"type": "summary_text", "text": "typed"},
+                        {"text": "inferred"},
+                        {},
+                        {"type": "reasoning_text", "text": "wrong discriminator"}
+                    ]
+                }
+            ]
+        }))
+        .unwrap(),
+    );
+
+    let normalized = super::normalize_create_body(&route, body);
+    let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+    assert_eq!(
+        value["input"][0]["summary"],
+        serde_json::json!([{"type": "summary_text", "text": "summary"}])
+    );
+    assert_eq!(
+        value["input"][0]["content"],
+        serde_json::json!([{"type": "reasoning_text", "text": "reasoning"}])
+    );
+    assert_eq!(value["input"][1]["summary"], serde_json::json!([]));
+    assert_eq!(
+        value["input"][1]["content"],
+        serde_json::json!([{"type": "reasoning_text", "text": "first"}])
+    );
+    assert_eq!(
+        value["input"][2]["summary"],
+        serde_json::json!([
+            {"type": "summary_text", "text": "typed"},
+            {"type": "summary_text", "text": "inferred"}
+        ])
+    );
+}
+
+#[test]
+fn normalizes_message_content_discriminators_and_omits_empty_parts() {
+    let route = resolve_responses_route("POST", "/v1/responses").unwrap();
+    let body = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-test",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"text": "answer"}, {}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": {
+                        "text_part": {"text": "question"},
+                        "image_part": {"image_url": "https://example.com/image.png"},
+                        "invalid": {"metadata": true}
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    );
+
+    let normalized = super::normalize_create_body(&route, body);
+    let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+    assert_eq!(
+        value["input"][0]["content"],
+        serde_json::json!([{"type": "output_text", "text": "answer"}])
+    );
+    let user_content = value["input"][1]["content"].as_array().unwrap();
+    assert_eq!(user_content.len(), 2);
+    assert!(user_content.contains(
+        &serde_json::json!({"type": "input_image", "image_url": "https://example.com/image.png"})
+    ));
+    assert!(user_content.contains(&serde_json::json!({"type": "input_text", "text": "question"})));
+}
+
+#[test]
 fn normalizes_collections_for_compact_and_input_token_requests_without_adding_store() {
     for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
         let route = resolve_responses_route("POST", path).unwrap();
