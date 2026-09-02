@@ -62,6 +62,7 @@ use crate::ListItemsParams;
 use crate::ListProjectsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
+use crate::ListTimelineParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
@@ -92,6 +93,7 @@ use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreFuture;
 use crate::ThreadStoreResult;
+use crate::TimelinePage;
 use crate::TurnPage;
 use crate::UpdateProjectParams;
 use crate::UpdateThreadMetadataParams;
@@ -403,6 +405,14 @@ impl LocalThreadStore {
         thread_history::list_items(self, params).await
     }
 
+    /// Lists bounded ordinary and realtime items from the rollout projection.
+    pub async fn list_timeline(
+        &self,
+        params: ListTimelineParams,
+    ) -> ThreadStoreResult<TimelinePage> {
+        thread_history::list_timeline(self, params).await
+    }
+
     /// Searches projection-backed visible messages within one paginated thread.
     pub async fn search_thread_occurrences(
         &self,
@@ -594,6 +604,10 @@ impl ThreadStore for LocalThreadStore {
 
     fn list_items(&self, params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
         Box::pin(LocalThreadStore::list_items(self, params))
+    }
+
+    fn list_timeline(&self, params: ListTimelineParams) -> ThreadStoreFuture<'_, TimelinePage> {
+        Box::pin(LocalThreadStore::list_timeline(self, params))
     }
 
     fn search_threads(
@@ -919,6 +933,7 @@ mod tests {
         let turn_context = |model: &str, approval_policy| {
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(cwd)).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -937,6 +952,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             })
@@ -1027,6 +1043,7 @@ mod tests {
                     phase: Some(MessagePhase::Commentary),
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 })),
                 RolloutItem::ResponseItem(
                     ResponseItem::FunctionCallOutput {

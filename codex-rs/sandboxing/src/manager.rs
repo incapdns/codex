@@ -119,6 +119,8 @@ pub struct SandboxExecRequest {
     pub network: Option<NetworkProxy>,
     pub network_environment_id: Option<String>,
     pub sandbox: SandboxType,
+    // TODO(anp): Reconcile these backend copies with the supplied sandbox context
+    // (TurnEnvironment::sandbox_context for turns), preserving this launch snapshot.
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub permission_profile: PermissionProfile,
@@ -139,6 +141,8 @@ pub struct SandboxTransformRequest<'a> {
     pub network: Option<&'a NetworkProxy>,
     pub sandbox_policy_cwd: &'a PathUri,
     pub codex_linux_sandbox_exe: Option<&'a Path>,
+    // TODO(anp): Reconcile these backend inputs with the supplied sandbox context
+    // (TurnEnvironment::sandbox_context for turns) so selection shares its authority.
     pub use_legacy_landlock: bool,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
@@ -297,6 +301,9 @@ impl SandboxManager {
         windows_sandbox_level: WindowsSandboxLevel,
         has_managed_network_requirements: bool,
     ) -> SandboxType {
+        #[cfg(windows)]
+        crate::windows_mxc::record_availability_once();
+
         if self.should_sandbox(permission_profile, pref, has_managed_network_requirements) {
             get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled)
                 .unwrap_or(SandboxType::None)

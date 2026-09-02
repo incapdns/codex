@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use assert_matches::assert_matches;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
@@ -1767,6 +1768,40 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
         ))
     );
 
+    let read_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "read")
+        .ok_or("skills.read tool should be registered")?;
+    // The resource fits the 2400-byte budget before escaping, but not after.
+    let insufficient_budget_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "package": format!("orchestrator/{opaque_suffix}"),
+        })
+        .to_string(),
+    };
+    let error = read_tool
+        .handle(ToolCall {
+            turn_id: "turn-1".to_string(),
+            call_id: "insufficient-read-budget".to_string(),
+            tool_name: read_tool.tool_name(),
+            model: "gpt-test".to_string(),
+            codex_turn_metadata: None,
+            truncation_policy: TruncationPolicy::Bytes(2_000),
+            source: ToolCallSource::Direct,
+            conversation_history: ConversationHistory::default(),
+            turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            environments: Vec::new(),
+            payload: insufficient_budget_payload,
+        })
+        .await
+        .err()
+        .expect("skills.read should reject a response that cannot fit any contents");
+    let error = assert_matches!(error, FunctionCallError::RespondToModel(error) => error);
+    assert_eq!(
+        error,
+        "skills.read response budget leaves no room for contents"
+    );
+
     Ok(())
 }
 
@@ -2414,7 +2449,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
 #[derive(Clone)]
 struct StaticSkillProvider {
     catalog: SkillCatalog,
-    read_requests: Arc<Mutex<Vec<SkillReadRequest>>>,
+    read_requests: Arc<Mutex<Vec<(SkillAuthority, SkillPackageId, SkillResourceId)>>>,
     list_calls: Option<Arc<AtomicUsize>>,
     fail_first_list: bool,
 }
@@ -2530,13 +2565,20 @@ impl SkillProvider for StaticSkillProvider {
         })
     }
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
         let read_requests = Arc::clone(&self.read_requests);
         Box::pin(async move {
             read_requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(request.clone());
+                .push((
+                    request.authority.clone(),
+                    request.package.clone(),
+                    request.resource.clone(),
+                ));
             Ok(SkillReadResult {
                 resource: request.resource,
                 contents: "# Lint Fix\n\nRun the formatter.".to_string(),
@@ -2602,18 +2644,10 @@ fn test_codex_home() -> PathBuf {
 }
 
 fn read_request_keys(
-    requests: &Arc<Mutex<Vec<SkillReadRequest>>>,
+    requests: &Mutex<Vec<(SkillAuthority, SkillPackageId, SkillResourceId)>>,
 ) -> Vec<(SkillAuthority, SkillPackageId, SkillResourceId)> {
     requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .map(|request| {
-            (
-                request.authority.clone(),
-                request.package.clone(),
-                request.resource.clone(),
-            )
-        })
-        .collect()
+        .clone()
 }

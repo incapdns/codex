@@ -31,15 +31,16 @@ impl SessionStartAction {
         config: &Config,
         target: &SessionTarget,
     ) -> Result<AppServerStartedThread> {
+        let local_settings = crate::local_settings::LocalSettings::from(config);
         match self {
             Self::Resume(settings) => {
                 app_server
-                    .resume_thread(config.clone(), target.thread_id, settings)
+                    .resume_thread(&local_settings, config.clone(), target.thread_id, settings)
                     .await
             }
             Self::Fork => {
                 app_server
-                    .fork_thread(config.clone(), target.thread_id)
+                    .fork_thread(&local_settings, config.clone(), target.thread_id)
                     .await
             }
         }
@@ -92,6 +93,7 @@ pub(crate) async fn cancel_session_start(app_server: AppServerSession) -> AppExi
         token_usage: Default::default(),
         thread_id: None,
         resume_hint: None,
+        disconnect_info: None,
         update_action: None,
         exit_reason: ExitReason::UserRequested,
     }

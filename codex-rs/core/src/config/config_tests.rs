@@ -229,6 +229,62 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn load_config_applies_optional_mcp_startup_grace() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str("mcp_optional_startup_grace_ms = 2500")
+        .expect("optional MCP startup grace should parse from config.toml");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.mcp_optional_startup_grace,
+        Duration::from_millis(2500)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_resolves_thread_unload_delay() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    for (toml, seconds) in [
+        ("", 60),
+        ("thread_unload_delay_secs = 0", 0),
+        ("thread_unload_delay_secs = 1800", 1800),
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(toml)?,
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
+        assert_eq!(config.thread_unload_delay, Duration::from_secs(seconds));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_thread_unload_delay_overflow() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let error = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            thread_unload_delay_secs: Some(u64::MAX),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await
+    .expect_err("idle timeout must fit in a monotonic deadline");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "thread_unload_delay_secs is too large");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_toml_parsing() {
     let history_with_persistence = r#"
 [history]
@@ -546,21 +602,24 @@ async fn load_config_resolves_non_prefixed_mcp_tool_servers() -> std::io::Result
 #[tokio::test]
 async fn load_config_resolves_update_plan_enabled() -> std::io::Result<()> {
     let codex_home = tempdir()?;
-    let config_toml = toml::from_str(
-        r#"
-[tools.update_plan]
-enabled = false
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-    let config = Config::load_from_base_config_with_overrides(
-        config_toml,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
+    for (config_toml, expected_enabled) in [
+        ("", false),
+        ("[tools.update_plan]", false),
+        ("[tools.update_plan]\nenabled = false", false),
+        ("[tools.update_plan]\nenabled = true", true),
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(config_toml).expect("TOML deserialization should succeed"),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
 
-    assert!(!config.update_plan_enabled);
+        assert_eq!(
+            config.update_plan_enabled, expected_enabled,
+            "{config_toml}"
+        );
+    }
     Ok(())
 }
 
@@ -1188,6 +1247,8 @@ fn config_toml_deserializes_model_availability_nux() {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
+            auto_recap: true,
+            disable_paste_burst: None,
             vim_mode_default: false,
             raw_output_mode: false,
             alternate_screen: AltScreenMode::default(),
@@ -1208,21 +1269,6 @@ fn config_toml_deserializes_model_availability_nux() {
             },
             terminal_resize_reflow_max_rows: None,
         }
-    );
-}
-
-#[test]
-fn config_toml_status_line_use_colors_defaults_to_enabled() {
-    let toml = r#"
-[tui]
-"#;
-    let cfg: ConfigToml =
-        toml::from_str(toml).expect("TOML deserialization should succeed for TUI config");
-
-    assert!(
-        cfg.tui
-            .expect("tui config should deserialize")
-            .status_line_use_colors
     );
 }
 
@@ -1276,20 +1322,6 @@ async fn runtime_config_defaults_model_availability_nux() {
 }
 
 #[test]
-fn test_tui_vim_mode_default_defaults_to_false() {
-    let toml = r#"
-        [tui]
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize empty [tui] table");
-    assert!(
-        !parsed
-            .tui
-            .expect("config should include tui section")
-            .vim_mode_default
-    );
-}
-
-#[test]
 fn test_tui_vim_mode_default_true() {
     let toml = r#"
         [tui]
@@ -1301,35 +1333,6 @@ fn test_tui_vim_mode_default_true() {
             .tui
             .expect("config should include tui section")
             .vim_mode_default
-    );
-}
-
-#[test]
-fn test_tui_raw_output_mode_defaults_to_false() {
-    let toml = r#"
-        [tui]
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize empty [tui] table");
-    assert!(
-        !parsed
-            .tui
-            .expect("config should include tui section")
-            .raw_output_mode
-    );
-}
-
-#[test]
-fn test_tui_raw_output_mode_true() {
-    let toml = r#"
-        [tui]
-        raw_output_mode = true
-    "#;
-    let parsed: ConfigToml = toml::from_str(toml).expect("deserialize raw_output_mode=true");
-    assert!(
-        parsed
-            .tui
-            .expect("config should include tui section")
-            .raw_output_mode
     );
 }
 
@@ -1349,6 +1352,38 @@ async fn runtime_config_uses_tui_raw_output_mode() {
     .expect("load config");
 
     assert!(cfg.tui_raw_output_mode);
+}
+
+#[tokio::test]
+async fn tui_auto_recap_defaults_and_cli_overrides() -> anyhow::Result<()> {
+    for (toml, override_value, expected) in [
+        ("", None, true),
+        ("[tui]", None, true),
+        ("[tui]\nauto_recap = true", None, true),
+        ("[tui]\nauto_recap = false", None, false),
+        ("[tui]\nauto_recap = true", Some(false), false),
+        ("[tui]\nauto_recap = false", Some(true), true),
+    ] {
+        let codex_home = TempDir::new()?;
+        std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), toml)?;
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .cli_overrides(
+                override_value
+                    .into_iter()
+                    .map(|enabled| ("tui.auto_recap".to_string(), TomlValue::Boolean(enabled)))
+                    .collect(),
+            )
+            .build()
+            .await?;
+
+        assert_eq!(
+            config.tui_auto_recap, expected,
+            "config: {toml}, override: {override_value:?}"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -4142,15 +4177,6 @@ theme = "dracula"
 }
 
 #[test]
-fn tui_theme_defaults_to_none() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(parsed.tui.as_ref().and_then(|t| t.theme.as_deref()), None);
-}
-
-#[test]
 fn tui_session_picker_view_deserializes_from_toml() {
     let cfg = r#"
 [tui]
@@ -4190,27 +4216,6 @@ pet = "chefito"
 }
 
 #[test]
-fn tui_session_picker_view_defaults_to_none() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().and_then(|t| t.session_picker_view),
-        None,
-    );
-}
-
-#[test]
-fn tui_pet_defaults_to_none() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(parsed.tui.as_ref().and_then(|t| t.pet.as_deref()), None);
-}
-
-#[test]
 fn tui_pet_anchor_deserializes_from_toml() {
     let cfg = r#"
 [tui]
@@ -4220,18 +4225,6 @@ pet_anchor = "screen-bottom"
     assert_eq!(
         parsed.tui.as_ref().map(|t| t.pet_anchor),
         Some(TuiPetAnchor::ScreenBottom),
-    );
-}
-
-#[test]
-fn tui_pet_anchor_defaults_to_composer() {
-    let cfg = r#"
-[tui]
-"#;
-    let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
-    assert_eq!(
-        parsed.tui.as_ref().map(|t| t.pet_anchor),
-        Some(TuiPetAnchor::Composer),
     );
 }
 
@@ -4267,6 +4260,8 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
+            auto_recap: true,
+            disable_paste_burst: None,
             vim_mode_default: false,
             raw_output_mode: false,
             alternate_screen: AltScreenMode::Auto,
@@ -4283,6 +4278,85 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             terminal_resize_reflow_max_rows: None,
         }
     );
+}
+
+#[tokio::test]
+async fn runtime_config_resolves_disable_paste_burst() -> anyhow::Result<()> {
+    for (toml, expected) in [
+        ("", false),
+        ("disable_paste_burst = true", true),
+        ("disable_paste_burst = true\n[tui]", true),
+        ("[tui]\ndisable_paste_burst = true", true),
+        (
+            "disable_paste_burst = true\n[tui]\ndisable_paste_burst = false",
+            false,
+        ),
+        (
+            "disable_paste_burst = false\n[tui]\ndisable_paste_burst = true",
+            true,
+        ),
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(toml)?,
+            ConfigOverrides::default(),
+            tempdir()?.abs(),
+        )
+        .await?;
+
+        assert_eq!(config.disable_paste_burst, expected, "config: {toml}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn disable_paste_burst_preserves_layering_and_new_key_precedence() -> anyhow::Result<()> {
+    for (toml, key, value, expected) in [
+        (
+            "disable_paste_burst = true",
+            "disable_paste_burst",
+            false,
+            false,
+        ),
+        (
+            "disable_paste_burst = true",
+            "tui.disable_paste_burst",
+            false,
+            false,
+        ),
+        (
+            "[tui]\ndisable_paste_burst = true",
+            "tui.disable_paste_burst",
+            false,
+            false,
+        ),
+        (
+            "[tui]\ndisable_paste_burst = true",
+            "disable_paste_burst",
+            false,
+            true,
+        ),
+        (
+            "[tui]\ndisable_paste_burst = false",
+            "disable_paste_burst",
+            true,
+            false,
+        ),
+    ] {
+        let codex_home = TempDir::new()?;
+        std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), toml)?;
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .cli_overrides(vec![(key.to_string(), TomlValue::Boolean(value))])
+            .build()
+            .await?;
+
+        assert_eq!(
+            config.disable_paste_burst, expected,
+            "config: {toml}, override: {key}={value}"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -5533,7 +5607,8 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
             .plugin_attributions_by_server_name(),
         HashMap::from([(
             "sample".to_string(),
-            McpPluginAttribution::new("sample@test".to_string(), "sample".to_string()),
+            McpPluginAttribution::new("sample@test".to_string(), "sample".to_string())
+                .with_host_root(PathUri::from_host_native_path(&plugin_root)?),
         )])
     );
 
@@ -6753,6 +6828,7 @@ approval_mode = "approve"
         server.tools.get("search"),
         Some(&McpServerToolConfig {
             approval_mode: Some(AppToolApproval::Approve),
+            ..Default::default()
         })
     );
 }
@@ -6796,6 +6872,7 @@ approval_mode = "approve"
         tool,
         &McpServerToolConfig {
             approval_mode: Some(AppToolApproval::Approve),
+            ..Default::default()
         }
     );
 }
@@ -7830,6 +7907,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
+                callback_url: None,
                 callback_port: None,
             }),
             oauth_resource: Some("https://resource.example.com".to_string()),
@@ -11161,6 +11239,28 @@ in_app_dictation = false
 }
 
 #[tokio::test]
+async fn in_app_local_automation_feature_requirements_are_valid() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[features]
+in_app_local_automation = false
+"#,
+            ),
+        )
+        .build()
+        .await?;
+
+    assert!(!config.features.enabled(Feature::InAppLocalAutomation));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn explicit_feature_config_is_normalized_by_requirements() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
@@ -11556,7 +11656,9 @@ max_concurrent_threads_per_session = 17
     for wait_agent_enabled in [true, false] {
         let mut config = config.clone();
         config.wait_agent_enabled = wait_agent_enabled;
-        let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+        let usage_hints = resolve_usage_hints(
+            &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+        );
         for hint in [usage_hints.root, usage_hints.subagent] {
             let hint = hint.expect("default usage hints should be present").body();
             assert!(hint.contains(concurrency_guidance));
@@ -11573,6 +11675,7 @@ max_concurrent_threads_per_session = 17
             root: Some(String::new()),
             subagent: Some(String::new()),
         }),
+        /*omit_update_plan_instructions*/ false,
     );
     assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
 }
@@ -11580,12 +11683,12 @@ max_concurrent_threads_per_session = 17
 #[test]
 fn multi_agent_v2_model_override_exposure_preserves_configured_usage_hints() {
     let config_toml = toml::from_str(
-        r#"[features.multi_agent_v2]
+        r###"[features.multi_agent_v2]
 enabled = true
-root_agent_usage_hint_text = "Root guidance."
-subagent_usage_hint_text = "Subagent guidance."
+root_agent_usage_hint_text = "## Plan tool\nRoot guidance."
+subagent_usage_hint_text = "## `update_plan`\nSubagent guidance."
 expose_spawn_agent_model_overrides = true
-"#,
+"###,
     )
     .expect("multi-agent v2 config should parse");
 
@@ -11593,11 +11696,11 @@ expose_spawn_agent_model_overrides = true
     assert!(config.expose_spawn_agent_model_overrides);
     assert_eq!(
         config.root_agent_usage_hint_text.as_deref(),
-        Some("Root guidance.")
+        Some("## Plan tool\nRoot guidance.")
     );
     assert_eq!(
         config.subagent_usage_hint_text.as_deref(),
-        Some("Subagent guidance.")
+        Some("## `update_plan`\nSubagent guidance.")
     );
     let usage_hints = resolve_usage_hints(
         &config,
@@ -11605,6 +11708,7 @@ expose_spawn_agent_model_overrides = true
             root: Some("Catalog root base.".to_string()),
             subagent: Some("Catalog subagent base.".to_string()),
         }),
+        /*omit_update_plan_instructions*/ true,
     );
     assert_eq!(
         (
@@ -11612,8 +11716,8 @@ expose_spawn_agent_model_overrides = true
             usage_hints.subagent.map(|hint| hint.body()),
         ),
         (
-            Some("Root guidance.".to_string()),
-            Some("Subagent guidance.".to_string()),
+            Some("## Plan tool\nRoot guidance.".to_string()),
+            Some("## `update_plan`\nSubagent guidance.".to_string()),
         )
     );
 }
@@ -11625,9 +11729,13 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
 
     let mut config = resolve_multi_agent_v2_config(&config_toml);
     assert!(config.expose_spawn_agent_model_overrides);
-    let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+    let usage_hints = resolve_usage_hints(
+        &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+    );
     config.expose_spawn_agent_model_overrides = false;
-    let usage_hints_without_model_overrides = resolve_usage_hints(&config, /*catalog*/ None);
+    let usage_hints_without_model_overrides = resolve_usage_hints(
+        &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+    );
 
     for (hint, hint_without_model_overrides) in [
         (usage_hints.root, usage_hints_without_model_overrides.root),
@@ -11742,6 +11850,7 @@ subagent_usage_hint_text = ""
             root: Some("catalog root".to_string()),
             subagent: Some("catalog subagent".to_string()),
         }),
+        /*omit_update_plan_instructions*/ false,
     );
     assert_eq!(
         (

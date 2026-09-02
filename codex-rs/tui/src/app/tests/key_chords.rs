@@ -61,6 +61,38 @@ fn ctrl(ch: char) -> KeyEvent {
 }
 
 #[tokio::test]
+async fn vim_buffer_jumps_route_default_chords_in_normal_and_operator_contexts() -> Result<()> {
+    for (input, command, expected) in [
+        ("one\ntwo\nthree", "gg", "!one\ntwo\nthree"),
+        ("one\ntwo\nthree", "dgg", "!"),
+        ("ag bg", "0fg", "a!g bg"),
+        ("ag bg", "0dfg", "! bg"),
+    ] {
+        let (mut app, mut tui, mut app_server) = chord_app().await?;
+        app.chat_widget.toggle_vim_mode_and_notify();
+        app.chat_widget.insert_str(input);
+
+        for (index, key) in command.chars().enumerate() {
+            press(
+                &mut app,
+                &mut tui,
+                &mut app_server,
+                KeyCode::Char(key).into(),
+            )
+            .await?;
+            if key == 'g' && index + 1 < command.len() {
+                assert!(app.key_chord_matcher.is_pending());
+            }
+        }
+
+        assert!(!app.key_chord_matcher.is_pending());
+        app.chat_widget.insert_str("!");
+        assert_eq!(app.chat_widget.composer_text_with_pending(), expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_global_chord_reuses_the_existing_action_handler() -> Result<()> {
     let (mut app, mut tui, mut app_server) = chord_app().await?;
 
@@ -80,6 +112,30 @@ async fn completed_global_chord_reuses_the_existing_action_handler() -> Result<(
     press(&mut app, &mut tui, &mut app_server, ctrl('t')).await?;
     assert!(!app.key_chord_matcher.is_pending());
     assert!(app.overlay.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_global_chords_toggle_output_and_request_external_editor() -> Result<()> {
+    let (mut app, mut tui, mut app_server) = chord_app().await?;
+    let config = toml::from_str(
+        "[global]\ntoggle_raw_output = [\"ctrl-x r\"]\nopen_external_editor = [\"ctrl-x e\"]",
+    )?;
+    app.keymap = RuntimeKeymap::from_config(&config).expect("valid global chords");
+    app.chat_widget.apply_keymap_update(config, &app.keymap);
+
+    for key in [ctrl('x'), KeyCode::Char('r').into()] {
+        press(&mut app, &mut tui, &mut app_server, key).await?;
+    }
+    assert!(app.chat_widget.raw_output_mode());
+
+    for key in [ctrl('x'), KeyCode::Char('e').into()] {
+        press(&mut app, &mut tui, &mut app_server, key).await?;
+    }
+    assert_eq!(
+        app.chat_widget.external_editor_state(),
+        super::ExternalEditorState::Requested
+    );
     Ok(())
 }
 

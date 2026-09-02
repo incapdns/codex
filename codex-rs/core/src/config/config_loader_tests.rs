@@ -779,6 +779,37 @@ foo = true"#;
     assert_eq!(config_error.range.start.column, 1);
 }
 
+#[tokio::test]
+async fn strict_config_accepts_removed_shared_compression_key_without_changing_compression() {
+    for enabled in [false, true] {
+        let tmp = tempdir().expect("tempdir");
+        let removed = !enabled;
+        std::fs::write(
+            tmp.path().join(CONFIG_TOML_FILE),
+            format!(
+                "[features]\nlocal_thread_store_compression = {enabled}\nlocal_thread_store_shared_compression = {removed}\n"
+            ),
+        )
+        .expect("write config");
+
+        let config = ConfigBuilder::default()
+            .codex_home(tmp.path().to_path_buf())
+            .fallback_cwd(Some(tmp.path().to_path_buf()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+            .strict_config(/*strict_config*/ true)
+            .build()
+            .await
+            .expect("removed feature remains accepted");
+
+        assert_eq!(
+            config
+                .features
+                .enabled(Feature::LocalThreadStoreCompression),
+            enabled
+        );
+    }
+}
+
 #[test]
 fn strict_config_points_to_unknown_nested_key() {
     let tmp = tempdir().expect("tempdir");
@@ -3713,6 +3744,10 @@ experimental_realtime_ws_base_url = "wss://attacker.example/realtime"
 [features]
 respect_system_proxy = true
 
+[features.network_proxy]
+enabled = true
+credential_broker = true
+
 [otel]
 environment = "attacker"
 
@@ -3737,6 +3772,12 @@ wire_api = "responses"
         /*project_root_markers*/ None,
     )
     .await?;
+    let managed_config_path = tmp.path().join("managed_config.toml");
+    tokio::fs::write(
+        &managed_config_path,
+        "[features.network_proxy]\nenabled = false\ncredential_broker = true\n",
+    )
+    .await?;
 
     let cwd = AbsolutePathBuf::from_absolute_path(&project_root)?;
     let layers = load_config_layers_state(
@@ -3744,7 +3785,7 @@ wire_api = "responses"
         &codex_home,
         Some(cwd),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides::default(),
+        LoaderOverrides::with_managed_config_path_for_tests(managed_config_path),
         &codex_config::NoopThreadConfigLoader,
     )
     .await?;
@@ -3767,6 +3808,8 @@ wire_api = "responses"
         "experimental_realtime_ws_base_url",
         "otel",
         "features.respect_system_proxy",
+        "features.network_proxy.credential_broker",
+        "features.network_proxy.enabled",
     ];
     let expected_startup_warnings = vec![format!(
         concat!(
@@ -3783,6 +3826,14 @@ wire_api = "responses"
     );
 
     let effective_config = layers.effective_config();
+    assert_eq!(
+        effective_config
+            .get("features")
+            .and_then(|features| features.get("network_proxy"))
+            .and_then(|network_proxy| network_proxy.get("enabled"))
+            .and_then(TomlValue::as_bool),
+        Some(false)
+    );
     assert_eq!(
         effective_config.get("model"),
         Some(&TomlValue::String("project-model".to_string()))

@@ -2,10 +2,22 @@
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
+#[path = "tests/agents_navigation_tests.rs"]
+mod agents_navigation_tests;
+#[path = "tests/backend_banner_fallback_tests.rs"]
+mod backend_banner_fallback_tests;
+#[path = "tests/backend_banner_recovery_tests.rs"]
+mod backend_banner_recovery_tests;
+#[path = "tests/backend_banner_startup_tests.rs"]
+mod backend_banner_startup_tests;
 #[path = "tests/background_exit_tests.rs"]
 mod background_exit_tests;
+#[path = "tests/buffered_replay.rs"]
+mod buffered_replay;
 #[path = "tests/connector_policy.rs"]
 mod connector_policy;
+#[path = "tests/disconnect_tests.rs"]
+mod disconnect;
 #[path = "tests/key_chords.rs"]
 mod key_chords;
 #[path = "tests/mcp_startup.rs"]
@@ -17,13 +29,19 @@ mod patch_approval_tests;
 mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
+#[path = "tests/recap_generation_tests.rs"]
+mod recap_generation;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/stream_animation_tests.rs"]
+mod stream_animation_tests;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
+#[path = "tests/transcript_composer.rs"]
+mod transcript_composer;
 #[path = "tests/turn_submission.rs"]
 mod turn_submission;
 
@@ -59,7 +77,6 @@ use crate::diff_model::FileChange;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::PermissionProfileSnapshot;
-use crate::legacy_core::config::TerminalResizeReflowMaxRows;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_protocol::AdditionalFileSystemPermissions;
 use codex_app_server_protocol::AdditionalNetworkPermissions;
@@ -547,6 +564,8 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
     let config = app.config.clone();
     let model = get_model_offline_for_tests(config.model.as_deref());
     app.chat_widget = ChatWidget::new_with_app_event(ChatWidgetInit {
+        requires_openai_auth: true,
+        local_settings: crate::local_settings::LocalSettings::from(&config),
         config,
         frame_requester: crate::tui::FrameRequester::test_dummy(),
         app_event_tx: app.app_event_tx.clone(),
@@ -2189,15 +2208,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
 
     runtime.block_on(async {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
-        let root = app_server
-            .start_thread(app.chat_widget.config_ref())
-            .await?;
-        let root_thread_id = root.session.thread_id;
-        app.enqueue_primary_thread_session(root.session, root.turns)
-            .await?;
-
+        let root_thread_id = ThreadId::new();
         let rollout_dir = app
             .config
             .codex_home
@@ -2206,6 +2217,29 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             .join("01")
             .join("01");
         std::fs::create_dir_all(&rollout_dir)?;
+        let root_session_meta = SessionMeta {
+            session_id: root_thread_id.into(),
+            id: root_thread_id,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            cwd: app.config.cwd.to_path_buf(),
+            originator: "codex-tui-test".to_string(),
+            cli_version: "0.0.0".to_string(),
+            source: RolloutSessionSource::Cli,
+            model_provider: Some(app.config.model_provider_id.clone()),
+            multi_agent_version: Some(MultiAgentVersion::V2),
+            ..SessionMeta::default()
+        };
+        let root_session_meta_line = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": serde_json::to_value(root_session_meta)?,
+        });
+        std::fs::write(
+            rollout_dir.join(format!(
+                "rollout-2026-01-01T00-00-00-{root_thread_id}.jsonl"
+            )),
+            format!("{root_session_meta_line}\n"),
+        )?;
         let mut child_thread_ids = Vec::new();
         for (index, multi_agent_version) in [MultiAgentVersion::V1, MultiAgentVersion::V2]
             .into_iter()
@@ -2214,7 +2248,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             let child_thread_id = ThreadId::new();
             let timestamp = format!("2026-01-01T00:00:0{index}Z");
             let session_meta = SessionMeta {
-                session_id: child_thread_id.into(),
+                session_id: root_thread_id.into(),
                 id: child_thread_id,
                 parent_thread_id: Some(root_thread_id),
                 timestamp: timestamp.clone(),
@@ -2241,7 +2275,27 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 "payload": serde_json::to_value(session_meta)?,
             });
             std::fs::write(rollout_path, format!("{session_meta_line}\n"))?;
+            child_thread_ids.push(child_thread_id);
+        }
 
+        // Cold-resume the persisted V2 root so its children are registered before selection.
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+        let root = app_server
+            .resume_thread(
+                &app.local_settings,
+                app.config.clone(),
+                root_thread_id,
+                crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+            )
+            .await?;
+        app.enqueue_primary_thread_session(root.session, root.turns)
+            .await?;
+        for (child_thread_id, multi_agent_version) in child_thread_ids
+            .iter()
+            .copied()
+            .zip([MultiAgentVersion::V1, MultiAgentVersion::V2])
+        {
             assert!(
                 app.attach_live_thread_for_selection(&mut app_server, child_thread_id)
                     .await?
@@ -2250,7 +2304,6 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 app.agent_navigation.is_parent_owned(child_thread_id),
                 multi_agent_version == MultiAgentVersion::V2
             );
-            child_thread_ids.push(child_thread_id);
         }
 
         app.agent_navigation
@@ -2309,6 +2362,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
 
         let resumed = app_server
             .resume_thread(
+                &app.local_settings,
                 app.config.clone(),
                 child_thread_ids[1],
                 app.resume_model_settings(),
@@ -2490,6 +2544,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
     let started = app_server
         .resume_thread(
+            &crate::local_settings::LocalSettings::from(&config),
             config,
             parent_thread_id,
             crate::app_server_session::ResumeModelSettings::RestoreFromThread,
@@ -3686,6 +3741,7 @@ async fn active_thread_file_change_approval_recovers_buffered_changes() {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             },
         }),
         /*replay_kind*/ None,
@@ -3755,7 +3811,7 @@ async fn inactive_thread_permissions_approval_preserves_file_system_permissions(
             item_id: "call-approval".to_string(),
             environment_id: Some("remote".to_string()),
             started_at_ms: 0,
-            cwd: test_absolute_path("/tmp"),
+            cwd: test_absolute_path("/tmp").into(),
             reason: Some("Need access to .git".to_string()),
             permissions: codex_app_server_protocol::RequestPermissionProfile {
                 network: Some(AdditionalNetworkPermissions {
@@ -3993,6 +4049,8 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 project_id: None,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 created_at: 1,
                 updated_at: 2,
                 recency_at: Some(2),
@@ -4092,6 +4150,8 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 project_id: None,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
                 created_at: 1,
                 updated_at: 2,
                 recency_at: Some(2),
@@ -4158,6 +4218,8 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         project_id: None,
         history_mode: Default::default(),
         model_provider: "read-provider".to_string(),
+        model: None,
+        reasoning_effort: None,
         created_at: 1,
         updated_at: 2,
         recency_at: Some(2),
@@ -5261,6 +5323,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
         };
         Arc::new(new_session_info(
             app.chat_widget.config_ref(),
+            &app.local_settings,
             app.chat_widget.current_model(),
             &session,
             is_first,
@@ -5378,6 +5441,7 @@ async fn make_test_app() -> App {
         workspace_command_runner: None,
         launch_cwd: config.cwd.to_path_buf(),
         runtime_working_directory_override: None,
+        local_settings: crate::local_settings::LocalSettings::from(&config),
         config,
         state_db: None,
         cli_kv_overrides: Vec::new(),
@@ -5400,7 +5464,7 @@ async fn make_test_app() -> App {
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
         key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-        commit_anim_running: Arc::new(AtomicBool::new(false)),
+        commit_animation: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         skill_load_warnings: SkillLoadWarningState::default(),
@@ -5410,10 +5474,12 @@ async fn make_test_app() -> App {
         feedback_audience: FeedbackAudience::External,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         app_server_target: crate::AppServerTarget::Embedded,
+        reconnect: Default::default(),
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
+        temporary_structured_requests: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         agents_overview: Default::default(),
@@ -5432,8 +5498,10 @@ async fn make_test_app() -> App {
         startup_protected_input_boundary: false,
         startup_pending_protected_request: false,
         rate_limit_hard_stop_generation: 0,
+        rate_limit_refresh_state: Default::default(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
+        recap: recap::RecapState::default(),
     }
 }
 
@@ -5457,6 +5525,7 @@ async fn make_test_app_with_channels() -> (
             workspace_command_runner: None,
             launch_cwd: config.cwd.to_path_buf(),
             runtime_working_directory_override: None,
+            local_settings: crate::local_settings::LocalSettings::from(&config),
             config,
             state_db: None,
             cli_kv_overrides: Vec::new(),
@@ -5479,7 +5548,7 @@ async fn make_test_app_with_channels() -> (
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
             key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            commit_animation: None,
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             skill_load_warnings: SkillLoadWarningState::default(),
@@ -5489,10 +5558,12 @@ async fn make_test_app_with_channels() -> (
             feedback_audience: FeedbackAudience::External,
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             app_server_target: crate::AppServerTarget::Embedded,
+            reconnect: Default::default(),
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
+            temporary_structured_requests: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             agents_overview: Default::default(),
@@ -5511,8 +5582,10 @@ async fn make_test_app_with_channels() -> (
             startup_protected_input_boundary: false,
             startup_pending_protected_request: false,
             rate_limit_hard_stop_generation: 0,
+            rate_limit_refresh_state: Default::default(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
+            recap: recap::RecapState::default(),
         },
         rx,
         op_rx,
@@ -5779,7 +5852,7 @@ fn rendered_line_text(line: &crate::terminal_hyperlinks::HyperlinkLine) -> Strin
 #[tokio::test]
 async fn capped_resize_reflow_renders_recent_suffix_only() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(5);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(5);
     app.transcript_cells = (0..20)
         .map(|i| plain_line_cell(format!("cell {i}")))
         .collect();
@@ -5807,7 +5880,7 @@ async fn capped_resize_reflow_renders_recent_suffix_only() {
 #[tokio::test]
 async fn uncapped_resize_reflow_renders_all_cells_when_row_cap_absent() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
     app.transcript_cells = (0..20)
         .map(|i| plain_line_cell(format!("cell {i}")))
         .collect();
@@ -5822,7 +5895,7 @@ async fn uncapped_resize_reflow_renders_all_cells_when_row_cap_absent() {
 #[tokio::test]
 async fn resize_reflow_wraps_transcript_early_when_pet_is_enabled() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
     app.transcript_cells = vec![Arc::new(AgentMarkdownCell::new(
         "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda".to_string(),
         Path::new("/tmp"),
@@ -5919,7 +5992,7 @@ async fn copy_picker_opening_preserves_terminal_scrollback_without_reflow() {
 #[tokio::test]
 async fn uncapped_resize_reflow_renders_all_cells_under_row_limit() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(100);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(100);
     app.transcript_cells = (0..3)
         .map(|i| plain_line_cell(format!("cell {i}")))
         .collect();
@@ -5945,7 +6018,7 @@ async fn uncapped_resize_reflow_renders_all_cells_under_row_limit() {
 #[tokio::test]
 async fn initial_replay_buffer_keeps_recent_rows_when_row_cap_present() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(3);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(3);
 
     app.begin_initial_history_replay_buffer();
     for index in 0..5 {
@@ -5979,7 +6052,7 @@ async fn initial_replay_buffer_keeps_recent_rows_when_row_cap_present() {
 #[tokio::test]
 async fn required_stream_reflow_during_capped_initial_replay_uses_transcript_tail() -> Result<()> {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(20);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(20);
     app.transcript_cells = vec![
         plain_line_cell("latest user question"),
         Arc::new(AgentMarkdownCell::new(
@@ -6033,7 +6106,7 @@ async fn required_stream_reflow_during_capped_initial_replay_uses_transcript_tai
 #[tokio::test]
 async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(20);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(20);
     app.begin_initial_history_replay_buffer();
     app.transcript_cells = vec![
         plain_line_cell("before directive"),
@@ -6070,7 +6143,7 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
 async fn required_stream_reflow_during_capped_initial_replay_survives_transcript_overlay()
 -> Result<()> {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(7);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(7);
     app.transcript_cells = vec![
         plain_line_cell("latest user question"),
         Arc::new(AgentMessageCell::new(
@@ -6130,7 +6203,7 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
 #[tokio::test]
 async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_present() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(3);
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(3);
 
     app.begin_thread_switch_history_replay_buffer();
 
@@ -6145,7 +6218,7 @@ async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_pres
 #[tokio::test]
 async fn thread_switch_replay_buffer_is_disabled_without_row_cap() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
 
     app.begin_thread_switch_history_replay_buffer();
 
@@ -6289,6 +6362,7 @@ fn exec_approval_request(
     ServerRequest::CommandExecutionRequestApproval {
         request_id: AppServerRequestId::Integer(1),
         params: CommandExecutionRequestApprovalParams {
+            kind: Default::default(),
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             item_id: item_id.to_string(),
@@ -6455,6 +6529,7 @@ fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
 #[test]
 fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
     let turn_error = AppServerTurnError {
+        misalignment: None,
         message: "cannot steer a review turn".to_string(),
         codex_error_info: Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable {
             turn_kind: AppServerNonSteerableTurnKind::Review,
@@ -6599,6 +6674,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
         };
         Arc::new(new_session_info(
             app.chat_widget.config_ref(),
+            &app.local_settings,
             app.chat_widget.current_model(),
             &session,
             is_first,
@@ -7253,6 +7329,7 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
     let started = app_server
         .resume_thread(
+            &crate::local_settings::LocalSettings::from(&config),
             config.clone(),
             source_thread_id,
             crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
@@ -7392,6 +7469,7 @@ async fn prompt_edit_before_first_prompt_starts_fresh_thread() -> Result<()> {
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
     let started = app_server
         .resume_thread(
+            &crate::local_settings::LocalSettings::from(&config),
             config.clone(),
             source_thread_id,
             crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
@@ -7489,6 +7567,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                             phase: None,
                             memory_citation: None,
                             delivery: None,
+                            questions: None,
                         },
                     ],
                     status: TurnStatus::Completed,
@@ -7539,6 +7618,8 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
     );
 
     let replacement = ChatWidget::new_with_app_event(ChatWidgetInit {
+        requires_openai_auth: true,
+        local_settings: crate::local_settings::LocalSettings::from(&app.config),
         config: app.config.clone(),
         frame_requester: crate::tui::FrameRequester::test_dummy(),
         app_event_tx: app.app_event_tx.clone(),
@@ -7673,6 +7754,13 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
     let store_snapshot = store.snapshot();
     assert_eq!(store_snapshot.session, Some(resumed_session));
     assert_eq!(store_snapshot.turns, snapshot.turns);
+    assert_eq!(
+        store.recap_progress(),
+        recap::RecapProgress {
+            completed_turns: 1,
+            last_recapped_turn_count: None,
+        }
+    );
 }
 
 #[tokio::test]
@@ -8571,3 +8659,10 @@ async fn side_backtrack_rejection_reports_unavailable_message_snapshot() {
 async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSession> {
     Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await
 }
+
+#[path = "tests/active_reconnect_tests.rs"]
+mod active_reconnect;
+
+#[cfg(unix)]
+#[path = "tests/navigation_reconnect_tests.rs"]
+mod navigation_reconnect;

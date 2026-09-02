@@ -167,11 +167,12 @@ impl StartupDraft {
 impl StartupDraftPump {
     /// Refresh the session header and safe editor shortcuts without enabling modal editing.
     pub(crate) fn apply_config(&mut self, config: &Config) {
+        let local_settings = crate::local_settings::LocalSettings::from(config);
         self.header = startup_session_header(Some(config));
         self.bottom_pane
-            .set_disable_paste_burst(config.disable_paste_burst);
+            .set_disable_paste_burst(local_settings.tui.disable_paste_burst.unwrap_or(false));
         self.bottom_pane.request_redraw();
-        if let Ok(keymap) = RuntimeKeymap::from_config(&config.tui_keymap) {
+        if let Ok(keymap) = RuntimeKeymap::from_config(&local_settings.tui.keymap) {
             self.bottom_pane.set_keymap_bindings(&keymap);
         }
     }
@@ -304,11 +305,15 @@ impl StartupDraftPump {
                     return Ok(());
                 }
                 TuiEvent::Paste(text) => !text.is_empty(),
-                TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume => {
+                TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume | TuiEvent::FocusGained => {
                     self.pending_paste_newline = Some((started_at, newlines));
                     if self.initial_screen == StartupDraftInitialScreen::Composer {
                         self.draw(tui, screen_size)?;
                     }
+                    return Ok(());
+                }
+                TuiEvent::FocusLost => {
+                    self.pending_paste_newline = Some((started_at, newlines));
                     return Ok(());
                 }
                 TuiEvent::Key(_) => false,
@@ -358,7 +363,8 @@ impl StartupDraftPump {
                     self.bottom_pane.handle_paste(text);
                 }
             }
-            TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume => {}
+            TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume | TuiEvent::FocusGained => {}
+            TuiEvent::FocusLost => return Ok(()),
         }
         if self.initial_screen == StartupDraftInitialScreen::Composer {
             self.draw(tui, screen_size)?;
