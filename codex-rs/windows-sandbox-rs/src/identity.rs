@@ -47,6 +47,24 @@ pub fn sandbox_setup_is_complete(codex_home: &Path) -> bool {
     matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
 }
 
+/// Returns true when setup artifacts and provisioned network settings match.
+pub fn sandbox_setup_is_complete_with_settings(
+    codex_home: &Path,
+    settings: &crate::WindowsSandboxProvisioningSettings,
+) -> bool {
+    let Ok(Some(mut marker)) = load_marker(codex_home) else {
+        return false;
+    };
+
+    marker.proxy_ports.sort_unstable();
+    let mut proxy_ports = settings.proxy_ports.clone();
+    proxy_ports.sort_unstable();
+    marker.version_matches()
+        && marker.proxy_ports == proxy_ports
+        && marker.allow_local_binding == settings.allow_local_binding
+        && matches!(load_users(codex_home), Ok(Some(users)) if users.version_matches())
+}
+
 fn load_marker(codex_home: &Path) -> Result<Option<SetupMarker>> {
     let path = setup_marker_path(codex_home);
     let marker = match fs::read_to_string(&path) {
@@ -215,13 +233,6 @@ pub fn require_logon_sandbox_creds(
                 env_map,
                 codex_home,
                 proxy_enforced,
-            },
-            crate::setup::SetupRootOverrides {
-                read_roots: Some(needed_read.clone()),
-                read_roots_include_platform_defaults,
-                write_roots: Some(needed_write.clone()),
-                deny_read_paths: Some(deny_read_paths_override.to_vec()),
-                deny_write_paths: Some(deny_write_paths_override.to_vec()),
             },
             &desired_offline_proxy_settings,
         )?;

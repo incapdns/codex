@@ -70,7 +70,7 @@ impl ChatWidget {
                 self.handle_turn_completed_notification(notification, replay_kind);
             }
             ServerNotification::ItemStarted(notification) => {
-                self.handle_item_started_notification(notification, replay_kind.is_some());
+                self.handle_item_started_notification(notification, replay_kind);
             }
             ServerNotification::ItemCompleted(notification) => {
                 self.handle_item_completed_notification(notification, replay_kind);
@@ -151,6 +151,14 @@ impl ChatWidget {
             }
             ServerNotification::ModelSafetyBufferingUpdated(notification) => {
                 self.on_model_safety_buffering_updated(notification, replay_kind)
+            }
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                self.add_info_message(notification.message, /*hint*/ None)
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                self.add_plain_history_lines(vec![
+                    vec!["✓ ".green(), notification.message.into()].into(),
+                ]);
             }
             ServerNotification::Warning(notification) => self.on_warning(notification.message),
             ServerNotification::GuardianWarning(notification) => {
@@ -238,6 +246,9 @@ impl ChatWidget {
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
             | ServerNotification::ThreadRealtimeStarted(_)
             | ServerNotification::ThreadRealtimeItemAdded(_)
+            | ServerNotification::ThreadRealtimeItemStarted(_)
+            | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
+            | ServerNotification::ThreadRealtimeItemCompleted(_)
             | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
             | ServerNotification::ThreadRealtimeError(_)
             | ServerNotification::ThreadRealtimeClosed(_)
@@ -341,9 +352,24 @@ impl ChatWidget {
     fn handle_item_started_notification(
         &mut self,
         notification: ItemStartedNotification,
-        from_replay: bool,
+        replay_kind: Option<ReplayKind>,
     ) {
         match notification.item {
+            ThreadItem::ContextCompaction { id }
+                if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) =>
+            {
+                // Buffered starts reconstruct an in-flight compaction when switching tasks.
+                let elapsed = if replay_kind == Some(ReplayKind::ThreadSnapshot) {
+                    let elapsed_ms = chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(notification.started_at_ms)
+                        .max(0);
+                    Duration::from_millis(elapsed_ms as u64)
+                } else {
+                    Duration::ZERO
+                };
+                self.on_context_compaction_started(id, elapsed);
+            }
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_started(item),
             ThreadItem::FileChange { id: _, changes, .. } => {
                 self.on_patch_apply_begin(file_update_changes_to_display(changes));
@@ -376,7 +402,7 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
-            ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
+            ThreadItem::EnteredReviewMode { review, .. } if replay_kind.is_none() => {
                 self.enter_review_mode_with_hint(review, /*from_replay*/ false);
             }
             _ => {}

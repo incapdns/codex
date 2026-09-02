@@ -6,6 +6,24 @@
 use super::*;
 
 impl ChatWidget {
+    /// Flush prior activity and preserve its separator before live or replayed assistant text.
+    pub(super) fn prepare_assistant_message(&mut self) {
+        // Before starting an agent stream, flush any active exec cell group.
+        self.flush_unified_exec_wait_streak();
+        self.flush_active_cell();
+        // If the previous turn inserted non-stream history (exec output, patch status, MCP
+        // calls), render a separator before starting the next streamed assistant message.
+        if self.transcript.needs_final_message_separator && self.transcript.had_work_activity {
+            self.add_to_history(history_cell::FinalMessageSeparator::new(
+                /*elapsed_seconds*/ None, /*runtime_metrics*/ None,
+            ));
+            self.transcript.needs_final_message_separator = false;
+        } else if self.transcript.needs_final_message_separator {
+            // Reset the flag even if we don't show separator (no work was done)
+            self.transcript.needs_final_message_separator = false;
+        }
+    }
+
     /// Replay a subset of initial events into the UI to seed the transcript when
     /// resuming an existing session. This approximates the live event flow and
     /// is intentionally conservative: only safe-to-replay items are rendered to
@@ -95,6 +113,7 @@ impl ChatWidget {
                 phase,
                 memory_citation,
                 delivery,
+                questions,
                 ..
             } => {
                 self.on_agent_message_item_completed(
@@ -120,6 +139,7 @@ impl ChatWidget {
                             }
                         }),
                         delivery,
+                        questions,
                     },
                     &turn_id,
                     from_replay,
@@ -156,26 +176,7 @@ impl ChatWidget {
                     codex_app_server_protocol::CommandExecutionStatus::Completed
                     | codex_app_server_protocol::CommandExecutionStatus::Failed,
                 ..
-            } if from_replay => {
-                if matches!(
-                    &item,
-                    ThreadItem::CommandExecution {
-                        status: codex_app_server_protocol::CommandExecutionStatus::Failed,
-                        ..
-                    }
-                ) {
-                    self.flush_completed_command_activity();
-                }
-                if !self.transcript.active_cell.as_ref().is_some_and(|cell| {
-                    cell.as_any()
-                        .downcast_ref::<ExecCell>()
-                        .is_some_and(ExecCell::is_active)
-                        || cell.as_any().is::<McpToolCallCell>()
-                }) {
-                    self.handle_command_execution_started_now(item.clone());
-                }
-                self.handle_command_execution_completed_now(item);
-            }
+            } if from_replay => self.handle_command_execution_completed_now(item),
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
@@ -215,8 +216,28 @@ impl ChatWidget {
             ThreadItem::ExitedReviewMode { .. } => {
                 self.exit_review_mode_after_item();
             }
-            ThreadItem::ContextCompaction { .. } => {
-                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+            ThreadItem::ContextCompaction { id } => {
+                self.on_context_compaction_completed(&id, from_replay);
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
+                    ));
+                }
             }
             ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {

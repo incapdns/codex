@@ -1,4 +1,6 @@
 use anyhow::Result;
+use codex_protocol::models::ConfigurationReasoning;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -72,6 +74,8 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             item: response_item.clone(),
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
+                fallback_token_limit_override: Some(20_000),
+                ..Default::default()
             }),
         }),
     };
@@ -84,7 +88,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             "ordinal": 7,
             "type": "response_item",
             "payload": response_item,
-            "metadata": { "client_authored": true },
+            "metadata": { "client_authored": true, "fallback_token_limit_override": 20_000 },
         })
     );
     assert_eq!(serialized["payload"].get("metadata"), None);
@@ -97,7 +101,55 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         envelope.metadata,
         Some(CodexHarnessMetadata {
             client_authored: true,
+            fallback_token_limit_override: Some(20_000),
+            ..Default::default()
         })
+    );
+    Ok(())
+}
+
+#[test]
+fn response_item_envelope_preserves_harness_authored_configuration_provenance() -> Result<()> {
+    let response_item = ResponseItem::ConfigurationUpdate {
+        reasoning: ConfigurationReasoning {
+            effort: ReasoningEffort::High,
+        },
+    };
+    let metadata = CodexHarnessMetadata {
+        harness_authored_configuration: true,
+        ..Default::default()
+    };
+    let rollout_item = RolloutItem::ResponseItem(ResponseItemEnvelope {
+        item: response_item.clone(),
+        metadata: Some(metadata.clone()),
+    });
+
+    let serialized = serde_json::to_value(&rollout_item)?;
+    assert_eq!(
+        serialized,
+        json!({
+            "type": "response_item",
+            "payload": {
+                "type": "configuration_update",
+                "reasoning": { "effort": "high" },
+            },
+            "metadata": {
+                "client_authored": false,
+                "harness_authored_configuration": true,
+            },
+        })
+    );
+
+    let restored = serde_json::from_value::<RolloutItem>(serialized)?;
+    let RolloutItem::ResponseItem(envelope) = restored else {
+        panic!("expected response item");
+    };
+    assert_eq!(
+        envelope,
+        ResponseItemEnvelope {
+            item: response_item,
+            metadata: Some(metadata),
+        }
     );
     Ok(())
 }
@@ -140,8 +192,8 @@ fn response_item_envelope_ignores_unknown_harness_metadata_fields() -> Result<()
 }
 
 #[test]
-/// Keeps legacy compacted replacement histories readable and shape-compatible.
-fn response_item_replacement_history_preserves_shape() -> Result<()> {
+/// Keeps legacy compacted replacement histories readable while adding nullable checkpoints.
+fn response_item_replacement_history_accepts_legacy_shape() -> Result<()> {
     let legacy_item = json!({
         "message": "summary",
         "replacement_history": [{
@@ -164,7 +216,10 @@ fn response_item_replacement_history_preserves_shape() -> Result<()> {
         ResponseItem::Message { .. }
     ));
     assert_eq!(replacement_history[0].metadata, None);
-    assert_eq!(serde_json::to_value(item)?, legacy_item);
+    let mut expected_item = legacy_item;
+    expected_item["compaction_response_id"] = json!(null);
+    expected_item["latest_token_usage_record"] = json!(null);
+    assert_eq!(serde_json::to_value(item)?, expected_item);
     Ok(())
 }
 
@@ -184,15 +239,20 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 item: developer_message.clone(),
                 metadata: Some(CodexHarnessMetadata {
                     client_authored: true,
+                    ..Default::default()
                 }),
             },
             ResponseItemEnvelope::new(compaction_item.clone()),
         ]),
+        retained_context: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     };
 
     let serialized = serde_json::to_value(item)?;
@@ -205,6 +265,8 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 { "client_authored": true },
                 { "client_authored": false },
             ],
+            "compaction_response_id": null,
+            "latest_token_usage_record": null,
         })
     );
 
@@ -216,6 +278,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 item: developer_message,
                 metadata: Some(CodexHarnessMetadata {
                     client_authored: true,
+                    ..Default::default()
                 }),
             },
             ResponseItemEnvelope {
@@ -277,6 +340,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         item: response_item.clone(),
         metadata: Some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         }),
     };
     let response_line = serde_json::to_value(RolloutItem::ResponseItem(envelope.clone()))?;
@@ -287,16 +351,26 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
     };
     assert_eq!(*legacy_response, response_item);
 
+    let checkpoint = crate::GuardianHistoryCheckpoint(vec![response_item.clone()]);
     let compacted_line = serde_json::to_value(RolloutItem::Compacted(CompactedItem {
         message: "summary".to_string(),
         replacement_history: Some(vec![envelope]),
+        retained_context: None,
+        guardian_history: Some(checkpoint.clone()),
         mcp_resource_origins: Some(McpResourceOriginCheckpoint::default()),
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     }))?;
 
+    let restored: RolloutItem = serde_json::from_value(compacted_line.clone())?;
+    let RolloutItem::Compacted(restored) = restored else {
+        panic!("expected compacted item");
+    };
+    assert_eq!(restored.guardian_history, Some(checkpoint));
     let LegacyRolloutItem::Compacted(legacy) =
         serde_json::from_value::<LegacyRolloutItem>(compacted_line)?
     else {
@@ -338,7 +412,11 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
         }),
         json!({
             "type": "compacted",
-            "payload": { "message": "summary" },
+            "payload": {
+                "message": "summary",
+                "compaction_response_id": null,
+                "latest_token_usage_record": null,
+            },
         }),
         json!({
             "type": "turn_context",
@@ -348,6 +426,40 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
                 "sandbox_policy": { "type": "danger-full-access" },
                 "model": "gpt-5",
                 "summary": "auto",
+            },
+        }),
+        json!({
+            "type": "token_usage_record",
+            "payload": {
+                "thread_id": "0195cda5-433d-7f9a-9d7b-a9f15b60c2e2",
+                "turn_id": "turn-1",
+                "session_id": "0195cda5-433d-7f9a-9d7b-a9f15b60c2e2",
+                "root_turn_id": "turn-1",
+                "response_id": "response-1",
+                "usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 2,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 3,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": 13,
+                },
+                "turn_token_usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 2,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 3,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": 13,
+                },
+                "thread_token_usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 2,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 3,
+                    "reasoning_output_tokens": 1,
+                    "total_tokens": 13,
+                },
             },
         }),
         json!({
@@ -367,6 +479,25 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
             "type": "event_msg",
             "payload": { "type": "warning", "message": "heads up" },
         }),
+        json!({
+            "type": "retained_context",
+            "payload": {
+                "type": "verified_answer",
+                "turn_id": "turn-1",
+                "call_id": "ask-1",
+                "questions": [{"question": "Publish?", "answer": "Only privately."}],
+            },
+        }),
+        json!({
+            "type": "realtime_item",
+            "payload": {
+                "id": "segment-1",
+                "realtime_session_id": "session-1",
+                "type": "transcript_segment",
+                "role": "assistant",
+                "text": "hello",
+            },
+        }),
     ];
 
     for expected in fixtures {
@@ -381,7 +512,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 9);
+    assert_eq!(variants.len(), 12);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");
@@ -432,11 +563,15 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
     let item = CompactedItem {
         message: "summary".to_string(),
         replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(3),
         first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
         previous_window_id: Some("019b3f6e-0000-7000-8000-000000000002".to_string()),
         window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     };
 
     assert_eq!(
@@ -447,6 +582,8 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
             "first_window_id": "019b3f6e-0000-7000-8000-000000000001",
             "previous_window_id": "019b3f6e-0000-7000-8000-000000000002",
             "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+            "compaction_response_id": null,
+            "latest_token_usage_record": null,
         })
     );
     Ok(())
@@ -465,11 +602,15 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
         CompactedItem {
             message: "summary".to_string(),
             replacement_history: None,
+            retained_context: None,
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(3),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }
     );
     Ok(())

@@ -16,6 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::time::Instant;
 
 use crate::FileSystemSandboxContext;
 use crate::local_process::shell_environment_policy;
@@ -25,12 +26,15 @@ use crate::protocol::ExecParams;
 use crate::protocol::ShellSnapshotRequest;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
+use crate::telemetry::ExecServerTelemetry;
 
 const MAX_CACHED_SNAPSHOTS: usize = 16;
 const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
 const MAX_SNAPSHOT_ENV_VALUE_BYTES: usize = 60 * 1024;
 const MAX_SNAPSHOT_SCOPE_BYTES: usize = 256;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
 
 #[derive(Default)]
 pub(crate) struct ShellSnapshotCache {
@@ -42,7 +46,9 @@ struct CachedShellSnapshot {
     cwd: PathUri,
     env_policy: Option<ExecEnvPolicy>,
     sandbox: Option<FileSystemSandboxContext>,
-    snapshot: Arc<OnceCell<Option<ShellSnapshot>>>,
+    attempts: usize,
+    // Failed captures store the earliest time another attempt may start.
+    snapshot: Arc<OnceCell<Result<ShellSnapshot, Instant>>>,
 }
 
 struct ShellSnapshot {
@@ -50,11 +56,19 @@ struct ShellSnapshot {
     environment: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapturePurpose {
+    Execution,
+    Prewarm,
+}
+
 impl ShellSnapshotCache {
     pub(crate) async fn prepare(
         &self,
         params: &ExecParams,
         prepared: &mut PreparedExecRequest,
+        telemetry: &ExecServerTelemetry,
+        purpose: CapturePurpose,
     ) -> Result<(), JSONRPCErrorError> {
         let Some(request) = params.shell_snapshot.as_ref() else {
             return Ok(());
@@ -93,7 +107,17 @@ impl ShellSnapshotCache {
                     && entry.sandbox == params.sandbox
             });
             let cached = position.and_then(|position| {
-                let entry = entries.remove(position)?;
+                let mut entry = entries.remove(position)?;
+                // Share each failed attempt during backoff. After the retry
+                // budget is exhausted, keep falling back until eviction.
+                if purpose == CapturePurpose::Execution
+                    && entry.attempts < MAX_SNAPSHOT_ATTEMPTS
+                    && let Some(Err(retry_at)) = entry.snapshot.get()
+                    && Instant::now() >= *retry_at
+                {
+                    entry.attempts += 1;
+                    entry.snapshot = Arc::new(OnceCell::new());
+                }
                 let snapshot = Arc::clone(&entry.snapshot);
                 entries.push_back(entry);
                 Some(snapshot)
@@ -107,6 +131,7 @@ impl ShellSnapshotCache {
                     cwd: params.cwd.clone(),
                     env_policy: params.env_policy.clone(),
                     sandbox: params.sandbox.clone(),
+                    attempts: 1,
                     snapshot: Arc::clone(&snapshot),
                 };
                 entries.push_back(entry);
@@ -117,20 +142,40 @@ impl ShellSnapshotCache {
                 snapshot
             }
         };
-        let Some(snapshot) = snapshot
-            .get_or_init(|| async {
-                match capture_snapshot(params, prepared, shell_type).await {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(err) => {
-                        tracing::warn!("failed to capture shell snapshot: {err:?}");
-                        None
-                    }
-                }
-            })
-            .await
-        else {
+        let capture = async {
+            let started_at = std::time::Instant::now();
+            let result = capture_snapshot(params, prepared, shell_type).await;
+            telemetry.shell_snapshot_captured(
+                started_at.elapsed(),
+                result.as_ref().map(|_| ()).map_err(|_| "capture_failed"),
+            );
+            result
+        };
+        let snapshot = match purpose {
+            CapturePurpose::Execution => {
+                snapshot
+                    .get_or_init(|| async {
+                        capture.await.map_err(|err| {
+                            tracing::warn!("failed to capture shell snapshot: {err:?}");
+                            Instant::now() + SNAPSHOT_RETRY_BACKOFF
+                        })
+                    })
+                    .await
+            }
+            CapturePurpose::Prewarm => {
+                // Leave the cell uninitialized on failure: a waiting real command
+                // can capture immediately, without spending its retry budget.
+                snapshot
+                    .get_or_try_init(|| async { capture.await.map(Ok) })
+                    .await?
+            }
+        };
+        let Ok(snapshot) = snapshot else {
             return Ok(());
         };
+        if purpose == CapturePurpose::Prewarm {
+            return Ok(());
+        }
 
         let request_overrides = params
             .env

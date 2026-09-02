@@ -94,9 +94,19 @@ pub struct InitializeResponse {
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentInfo {
     pub shell: ShellInfo,
+    /// Executor release version for version-based compatibility decisions.
+    /// `0.0.0` when unknown, including responses from legacy executors.
+    #[serde(default = "unknown_executor_version")]
+    pub executor_version: String,
     /// Working directory inherited by the exec-server process.
     #[serde(default)]
     pub cwd: Option<PathUri>,
+    /// Executor user home used to expand `~` in path-bearing values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_home_dir: Option<PathUri>,
+    /// Operating system reported by the executor; absent for legacy exec-servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_os: Option<String>,
     /// Executor-local default directories for resolving `:tmpdir`, when reported.
     /// On Windows, a command's `TEMP` or `TMP` overrides take precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +117,10 @@ pub struct EnvironmentInfo {
     /// Optional executor features that clients must gate before sending newer request fields.
     #[serde(default)]
     pub capabilities: EnvironmentCapabilities,
+}
+
+fn unknown_executor_version() -> String {
+    "0.0.0".to_string()
 }
 
 /// Features supported by the selected exec-server environment.
@@ -153,9 +167,16 @@ pub enum EnvironmentStatusKind {
 }
 
 impl EnvironmentInfo {
-    /// Returns information about the current local exec-server process.
-    pub fn local() -> Self {
+    /// Returns executor-local default directories used to resolve `:tmpdir`.
+    ///
+    /// This is separate from `local` so orchestrator startup can cache the
+    /// directories without repeating local shell detection.
+    pub fn local_temporary_directories() -> Vec<PathUri> {
         let cwd = std::env::current_dir().ok();
+        Self::local_temporary_directories_with_cwd(cwd.as_deref())
+    }
+
+    fn local_temporary_directories_with_cwd(cwd: Option<&std::path::Path>) -> Vec<PathUri> {
         let temporary_directory_env_vars: &[&str] = if cfg!(windows) {
             &["TEMP", "TMP"]
         } else {
@@ -181,11 +202,30 @@ impl EnvironmentInfo {
                 temporary_directories.push(path);
             }
         }
+        temporary_directories
+    }
+
+    /// Returns information about the current local exec-server process.
+    pub fn local() -> Self {
+        let cwd = std::env::current_dir().ok();
+        let temporary_directories = Self::local_temporary_directories_with_cwd(cwd.as_deref());
+        let normalize_temp_path = |path: std::ffi::OsString| {
+            PathUri::from_host_native_path(&path).ok().or_else(|| {
+                if cfg!(unix) {
+                    PathUri::from_host_native_path(cwd.as_ref()?.join(path)).ok()
+                } else {
+                    None
+                }
+            })
+        };
         let temp_dir = normalize_temp_path(std::env::temp_dir().into_os_string());
 
         Self {
             shell: codex_shell_command::shell_detect::default_user_shell().into(),
+            executor_version: unknown_executor_version(),
             cwd: cwd.and_then(|cwd| PathUri::from_host_native_path(cwd).ok()),
+            user_home_dir: PathUri::from_host_native_path("~").ok(),
+            platform_os: Some(std::env::consts::OS.to_string()),
             temporary_directories: Some(temporary_directories),
             temp_dir,
             capabilities: EnvironmentCapabilities {
@@ -949,7 +989,10 @@ mod tests {
                     name: "zsh".to_string(),
                     path: "/bin/zsh".to_string(),
                 },
+                executor_version: "0.0.0".to_string(),
                 cwd: None,
+                user_home_dir: None,
+                platform_os: None,
                 temporary_directories: None,
                 temp_dir: None,
                 capabilities: EnvironmentCapabilities::default(),
@@ -979,10 +1022,13 @@ mod tests {
     }
 
     #[test]
-    fn environment_info_preserves_executor_temporary_directories() {
+    fn environment_info_preserves_executor_metadata() {
         let expected = serde_json::json!({
             "shell": { "name": "powershell", "path": "powershell.exe" },
+            "executorVersion": "1.2.3-alpha.4",
             "cwd": null,
+            "userHomeDir": "file:///C:/Users/remote",
+            "platformOs": "windows",
             "temporaryDirectories": ["file:///C:/Temp", "file:///D:/Temp"],
             "capabilities": {
                 "networkProxyLaunch": false,
@@ -994,7 +1040,7 @@ mod tests {
             },
         });
         let info: EnvironmentInfo = serde_json::from_value(expected.clone())
-            .expect("environment info with executor temporary directories should deserialize");
+            .expect("environment info with executor metadata should deserialize");
 
         assert_eq!(
             serde_json::to_value(info).expect("environment info should serialize"),
@@ -1027,10 +1073,9 @@ mod tests {
             .collect::<Vec<_>>();
         expected.dedup();
 
-        assert_eq!(
-            EnvironmentInfo::local().temporary_directories,
-            Some(expected)
-        );
+        let info = EnvironmentInfo::local();
+        assert_eq!(info.temporary_directories, Some(expected));
+        assert_eq!(info.user_home_dir, PathUri::from_host_native_path("~").ok());
     }
 
     #[cfg(unix)]
@@ -1124,11 +1169,16 @@ mod tests {
             file_system,
             network: NetworkSandboxPolicy::Restricted,
         };
-        let sandbox =
+        let mut sandbox =
             FileSystemSandboxContext::from_permission_profile_with_cwd(permissions, cwd.clone());
+        sandbox.user_home_dir = Some(cwd.clone());
 
         let serialized = serde_json::to_value(&sandbox).expect("serialize sandbox");
 
+        assert_eq!(
+            serialized["userHomeDir"],
+            serde_json::json!(cwd.to_string())
+        );
         assert_eq!(
             serialized["permissions"]["file_system"]["entries"][0]["path"]["path"],
             serde_json::json!(cwd.to_string())

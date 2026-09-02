@@ -22,6 +22,7 @@ use codex_windows_sandbox::log_note;
 use codex_windows_sandbox::log_writer;
 use codex_windows_sandbox::path_mask_allows;
 use codex_windows_sandbox::path_write_aces_need_refresh;
+use codex_windows_sandbox::resolve_sid;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
@@ -60,6 +61,7 @@ use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::CONTAINER_INHERIT_ACE;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
+use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
@@ -79,7 +81,6 @@ use sandbox_users::commit_setup_marker;
 use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
 use sandbox_users::resolve_sandbox_users_group_sid;
-use sandbox_users::resolve_sid;
 use sandbox_users::sid_bytes_to_psid;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -112,8 +113,15 @@ struct Payload {
 enum SetupMode {
     #[default]
     Full,
+    InteractiveProvision,
     ProvisionOnly,
     ReadAclsOnly,
+}
+
+#[derive(Clone, Copy)]
+enum DaclInheritance {
+    Inherited,
+    Protected,
 }
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
@@ -294,6 +302,7 @@ fn read_mask_allows_or_log(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lock_sandbox_dir(
     dir: &Path,
     real_user: &str,
@@ -301,12 +310,13 @@ fn lock_sandbox_dir(
     sandbox_group_access_mode: i32,
     sandbox_group_mask: u32,
     real_user_mask: u32,
+    dacl_inheritance: DaclInheritance,
     setup_mode: SetupMode,
 ) -> Result<()> {
     // ProvisionOnly accepts another user's CODEX_HOME; keep its ACL mutation
-    // bound to a no-reparse handle without changing full setup behavior.
+    // bound to a no-reparse handle without changing interactive setup behavior.
     let directory = match setup_mode {
-        SetupMode::Full | SetupMode::ReadAclsOnly => {
+        SetupMode::Full | SetupMode::InteractiveProvision | SetupMode::ReadAclsOnly => {
             std::fs::create_dir_all(dir)?;
             None
         }
@@ -372,12 +382,18 @@ fn lock_sandbox_dir(
                 "SetEntriesInAclW sandbox dir failed: {set}",
             ));
         }
+        let security_information = match dacl_inheritance {
+            DaclInheritance::Inherited => DACL_SECURITY_INFORMATION,
+            DaclInheritance::Protected => {
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            }
+        };
         let (res, api) = match directory.as_ref() {
             Some(directory) => (
                 SetSecurityInfo(
                     directory.as_raw_handle() as _,
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
+                    security_information,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     new_dacl,
@@ -391,7 +407,7 @@ fn lock_sandbox_dir(
                     SetNamedSecurityInfoW(
                         path_w.as_ptr() as *mut u16,
                         SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
+                        security_information,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                         new_dacl,
@@ -513,7 +529,9 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
     }
     match payload.mode {
         SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
-        SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
+        SetupMode::InteractiveProvision | SetupMode::ProvisionOnly => {
+            run_provision_only(payload, log, sbx_dir)
+        }
         SetupMode::Full => run_setup_full(payload, log, sbx_dir),
     }?;
     if writes_setup_marker {
@@ -668,6 +686,7 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        DaclInheritance::Inherited,
         payload.mode,
     )
     .map_err(|err| {
@@ -686,6 +705,7 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
         DENY_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        DaclInheritance::Inherited,
         payload.mode,
     )
     .map_err(|err| {
@@ -712,6 +732,7 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+        DaclInheritance::Protected,
         payload.mode,
     )
     .map_err(|err| {
@@ -1036,6 +1057,10 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 }
 
 #[cfg(test)]
+#[path = "win_acl_tests.rs"]
+mod acl_tests;
+
+#[cfg(test)]
 mod tests {
     use super::Payload;
     use super::SETUP_VERSION;
@@ -1084,6 +1109,15 @@ mod tests {
         let payload: Payload = serde_json::from_value(payload).expect("payload");
 
         assert_eq!(payload.mode, super::SetupMode::ProvisionOnly);
+    }
+
+    #[test]
+    fn payload_accepts_interactive_provision_mode() {
+        let mut payload = payload_json();
+        payload["mode"] = json!("interactive-provision");
+        let payload: Payload = serde_json::from_value(payload).expect("payload");
+
+        assert_eq!(payload.mode, super::SetupMode::InteractiveProvision);
     }
 
     #[test]

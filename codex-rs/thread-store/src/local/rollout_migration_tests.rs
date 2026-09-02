@@ -48,11 +48,13 @@ use super::LocalThreadStore;
 use super::RolloutMigrationFailureReason;
 use super::RolloutMigrationMode;
 use super::RolloutMigrationOptions;
+use super::RolloutMigrationPaths;
 use super::RolloutMigrationProgress;
 use super::RolloutMigrationStatus;
 #[cfg(unix)]
 use super::decompress_rollout_to_path;
 use super::migration_journal_path;
+use super::telemetry::RolloutMigrationTrigger;
 use super::thread_history;
 use super::write_migration_journal;
 use crate::ItemSortKey;
@@ -158,6 +160,7 @@ fn agent_message(text: &str) -> RolloutItem {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     }))
 }
 
@@ -228,11 +231,15 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: "checkpoint".to_string(),
         replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+        retained_context: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 
@@ -439,6 +446,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        imagegen_request_id: None,
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -1069,6 +1077,23 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         turns: vec!["keep-before-compaction".to_string()],
         current_turn_id: Some("keep-before-compaction".to_string()),
     });
+    let answer_event = serde_json::from_value(serde_json::json!({
+        "type": "verified_answer", "turn_id": "keep-before-compaction", "call_id": "ask-1",
+        "questions": [{"question": "Publish?", "answer": "Only privately."}]
+    }))
+    .expect("verified answer fixture");
+    let wake_answer_event = serde_json::from_value(serde_json::json!({
+        "type": "verified_answer", "turn_id": "empty-answer-turn", "call_id": "ask-2",
+        "questions": [{"question": "Continue?", "answer": "Keep it private."}]
+    }))
+    .expect("empty-turn answer fixture");
+    checkpoint.retained_context = Some(Default::default());
+    let context = checkpoint
+        .retained_context
+        .as_mut()
+        .expect("retained context");
+    context.record(&answer_event);
+    context.record(&wake_answer_event);
     let path = write_rollout(
         home.path(),
         thread_id,
@@ -1076,7 +1101,11 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         vec![
             started("keep-before-compaction"),
             user_message("old question"),
+            RolloutItem::RetainedContext(answer_event),
             completed("keep-before-compaction"),
+            started("empty-answer-turn"),
+            RolloutItem::RetainedContext(wake_answer_event),
+            completed("empty-answer-turn"),
             RolloutItem::Compacted(checkpoint),
             started("remove-after-compaction"),
             user_message("new question"),
@@ -1106,7 +1135,13 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         .await
         .expect("read rollback-through-compaction turns");
     assert_eq!(turns.turns.len(), 1);
-    let checkpoint = read_rollout(&path)
+    let migrated = read_rollout(&path);
+    assert!(
+        !migrated
+            .iter()
+            .any(|line| matches!(line.item, RolloutItem::RetainedContext(_)))
+    );
+    let checkpoint = migrated
         .into_iter()
         .find_map(|line| match line.item {
             RolloutItem::Compacted(item) => Some(item),
@@ -1115,6 +1150,87 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         .expect("retained compaction");
     assert_eq!(checkpoint.replacement_history, Some(Vec::new()));
     assert_eq!(checkpoint.mcp_resource_origins, None);
+    assert_eq!(
+        checkpoint
+            .retained_context
+            .expect("retained context checkpoint")
+            .verified_answers()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn migration_preserves_answers_before_a_rolled_back_steer() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let mut items = vec![started("shared-turn")];
+    let mut answers = Vec::new();
+    let RolloutItem::Compacted(mut checkpoint) = compacted(vec![
+        input_response_message("user", "before-steer"),
+        input_response_message("user", "after-steer"),
+    ]) else {
+        unreachable!()
+    };
+    checkpoint.retained_context = Some(Default::default());
+    for call_id in ["before-steer", "after-steer"] {
+        items.push(user_message(call_id));
+        let mut call: ResponseItem = serde_json::from_value(json!({
+            "type": "function_call", "call_id": call_id,
+            "name": "request_user_input", "arguments": "{}"
+        }))
+        .expect("request_user_input call");
+        call.set_turn_id_if_missing("shared-turn");
+        items.push(rollout_response_item(call));
+        let answer: codex_rollout::RetainedContextEvent = serde_json::from_value(json!({
+            "type": "verified_answer", "turn_id": "shared-turn", "call_id": call_id,
+            "questions": [{"question": "Publish?", "answer": "Only privately."}]
+        }))
+        .expect("verified answer");
+        checkpoint
+            .retained_context
+            .as_mut()
+            .expect("retained context")
+            .record(&answer);
+        answers.push(answer);
+    }
+    // Delayed delivery must use the original call boundary, not the turn's latest steer.
+    items.extend(answers.iter().cloned().map(RolloutItem::RetainedContext));
+    items.push(completed("shared-turn"));
+    items.push(RolloutItem::Compacted(checkpoint));
+    items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        ThreadRolledBackEvent { num_turns: 1 },
+    )));
+    let path = write_rollout(home.path(), thread_id, SessionSource::Cli, items);
+    let store = indexed_store(home.path()).await;
+    store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate rollback of a steer");
+    let migrated = read_rollout(&path);
+    let events = migrated
+        .iter()
+        .filter_map(|line| match &line.item {
+            RolloutItem::RetainedContext(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events, answers[..1]);
+    let checkpoint = migrated
+        .iter()
+        .find_map(|line| match &line.item {
+            RolloutItem::Compacted(checkpoint) => checkpoint.retained_context.as_ref(),
+            _ => None,
+        })
+        .expect("retained checkpoint");
+    assert_eq!(
+        checkpoint
+            .verified_answers()
+            .cloned()
+            .map(codex_rollout::RetainedContextEvent::VerifiedAnswer)
+            .collect::<Vec<_>>(),
+        answers[..1]
+    );
 }
 
 #[tokio::test]
@@ -1403,11 +1519,15 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             RolloutItem::Compacted(CompactedItem {
                 message: "superseded checkpoint".repeat(1024),
                 replacement_history: Some(Vec::new()),
+                retained_context: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::Compacted(CompactedItem {
                 message: "latest checkpoint".to_string(),
@@ -1423,15 +1543,20 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                     }
                     .into(),
                 ]),
+                retained_context: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             started("child-turn"),
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("child-turn".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(json!(home.path())).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -1450,6 +1575,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             }),
@@ -1784,6 +1910,37 @@ async fn migration_migrates_archived_rollouts_without_unarchiving_them() {
         .expect("read archived projected turns");
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].items.len(), 2);
+}
+
+#[tokio::test]
+async fn migration_retries_a_rollout_moved_after_path_discovery() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    let active_path = write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("question"), agent_message("answer")],
+    );
+    let store = indexed_store(home.path()).await;
+    let archived_path = move_to_archived(home.path(), active_path.clone());
+
+    let report = store
+        .migrate_rollouts_with_progress_for_trigger(
+            apply_options(),
+            |_| {},
+            RolloutMigrationTrigger::Startup,
+            RolloutMigrationPaths::Known(vec![active_path]),
+        )
+        .await
+        .expect("migrate moved rollout");
+
+    assert_eq!(report.outcomes[0].status, RolloutMigrationStatus::Migrated);
+    assert!(matches!(
+        &read_rollout(&archived_path)[0].item,
+        RolloutItem::SessionMeta(metadata)
+            if metadata.meta.history_mode == ThreadHistoryMode::Paginated
+    ));
 }
 
 #[tokio::test]

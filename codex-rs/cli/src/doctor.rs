@@ -4,7 +4,8 @@
 //! configuration, authentication, terminal, state paths, and bounded reachability
 //! probes without attempting repair or starting long-lived services. Each check
 //! returns a redacted, serializable row so the same data can back the human
-//! summary and `--json` support report.
+//! summary and `--json` support report. PATH entries are untrusted data: checks
+//! may inspect them, but must not execute the programs they select.
 //!
 //! A failing check should describe the problem and remediation, but it should not
 //! mutate user state. That keeps the command safe to run before filing a support
@@ -21,7 +22,6 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -133,10 +133,6 @@ const COLOR_ENV_VARS: &[&str] = &[
 const TERMINAL_DIMENSION_ENV_VARS: &[&str] = &["COLUMNS", "LINES"];
 const TERMINFO_ENV_VARS: &[&str] = &["TERMINFO", "TERMINFO_DIRS"];
 const LOCALE_ENV_VARS: &[&str] = &["LC_ALL", "LC_CTYPE", "LANG"];
-#[cfg(windows)]
-const NPM_COMMAND: &str = "npm.cmd";
-#[cfg(not(windows))]
-const NPM_COMMAND: &str = "npm";
 const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "SSH_TTY",
     "SSH_CONNECTION",
@@ -150,25 +146,22 @@ const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "DISPLAY",
     "WT_SESSION",
 ];
-const TMUX_OPTION_NAMES: &[&str] = &[
-    "extended-keys",
-    "xterm-keys",
-    "allow-passthrough",
-    "set-clipboard",
-    "focus-events",
-];
 const NARROW_TERMINAL_COLUMNS: u16 = 80;
 const NARROW_TERMINAL_ROWS: u16 = 24;
 
 /// Options for building a local Codex diagnostic report.
 ///
-/// The command always runs the full bounded diagnostic set. Human output includes
+/// The command always runs the full diagnostic set. Human output includes
 /// detailed diagnostics by default; --summary keeps the terminal output compact.
 #[derive(Debug, Parser)]
 pub struct DoctorCommand {
     /// Emit a redacted machine-readable report.
     #[arg(long, default_value_t = false)]
     json: bool,
+
+    /// Limit database integrity scans when collecting a feedback attachment.
+    #[arg(long, hide = true, default_value_t = false)]
+    feedback: bool,
 
     /// Only show grouped check rows and the final count summary.
     #[arg(long, default_value_t = false)]
@@ -426,7 +419,7 @@ async fn build_report(
                         ),
                     })
                 },
-                async { run_sync_check("updates", progress.clone(), || updates_check(config)) },
+                run_async_check("updates", progress.clone(), updates_check(config)),
                 async {
                     run_sync_check("network", progress.clone(), || network::check(Some(config)))
                 },
@@ -446,13 +439,15 @@ async fn build_report(
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(config.cwd.as_path())),
+                async {
+                    run_sync_check("git", progress.clone(), || git_check(config.cwd.as_path()))
+                },
                 async {
                     run_sync_check("terminal title", progress.clone(), || {
                         terminal_title_check(config)
                     })
                 },
-                run_async_check("state", progress.clone(), state_check(config)),
+                run_async_check("state", progress.clone(), state_check(config, command)),
                 run_async_check(
                     "thread inventory",
                     progress.clone(),
@@ -524,7 +519,7 @@ async fn build_report(
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(&cwd)),
+                async { run_sync_check("git", progress.clone(), || git_check(&cwd)) },
                 async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
@@ -872,6 +867,10 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         env::var_os("CODEX_MANAGED_BY_BUN").is_some()
     ));
     details.push(format!(
+        "managed by Vite+: {}",
+        env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_some()
+    ));
+    details.push(format!(
         "managed by pnpm: {}",
         env::var_os("CODEX_MANAGED_BY_PNPM").is_some()
     ));
@@ -899,41 +898,15 @@ fn installation_check(show_details: bool) -> DoctorCheck {
     }
 
     if doctor_managed_by_npm(current_exe.as_deref()) {
-        match npm_global_root_check() {
-            NpmRootCheck::Match { package_root } => {
-                details.push(format!("npm update target: {}", package_root.display()));
-            }
-            NpmRootCheck::Mismatch {
-                running_package_root,
-                npm_package_root,
-            } => {
-                status = CheckStatus::Fail;
-                summary =
-                    "npm install -g @openai/codex would update a different install".to_string();
-                remediation = Some(format!(
-                    "Fix PATH or npm prefix so the running package root ({}) matches the npm global package root ({}).",
-                    running_package_root.display(),
-                    npm_package_root.display()
-                ));
-                details.push(format!(
-                    "running package root: {}",
-                    running_package_root.display()
-                ));
-                details.push(format!("npm package root: {}", npm_package_root.display()));
-            }
-            NpmRootCheck::MissingPackageRoot => {
-                status = status.max(CheckStatus::Warning);
-                summary = "npm-managed launch is missing package-root provenance".to_string();
-                remediation = Some(
-                    "Reinstall or update Codex so the JS shim provides CODEX_MANAGED_PACKAGE_ROOT."
-                        .to_string(),
-                );
-            }
-            NpmRootCheck::NpmUnavailable(error) => {
-                status = status.max(CheckStatus::Warning);
-                summary = "npm-managed launch could not inspect npm global root".to_string();
-                details.push(format!("npm root -g failed: {error}"));
-            }
+        details
+            .push("npm update target: not inspected (PATH helpers are not executed)".to_string());
+        if env::var_os("CODEX_MANAGED_PACKAGE_ROOT").is_none() {
+            status = status.max(CheckStatus::Warning);
+            summary = "npm-managed launch is missing package-root provenance".to_string();
+            remediation = Some(
+                "Reinstall or update Codex so the JS shim provides CODEX_MANAGED_PACKAGE_ROOT."
+                    .to_string(),
+            );
         }
     }
 
@@ -963,6 +936,7 @@ fn doctor_managed_by_npm(current_exe: Option<&Path>) -> bool {
 fn inherited_managed_env_for_cargo_binary(current_exe: Option<&Path>) -> bool {
     if env::var_os("CODEX_MANAGED_BY_NPM").is_none()
         && env::var_os("CODEX_MANAGED_BY_BUN").is_none()
+        && env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_none()
         && env::var_os("CODEX_MANAGED_BY_PNPM").is_none()
     {
         return false;
@@ -1016,6 +990,9 @@ fn describe_install_context(context: &InstallContext) -> String {
         InstallMethod::Bun => {
             describe_method_with_package_layout("bun", context.package_layout.as_ref())
         }
+        InstallMethod::VitePlus => {
+            describe_method_with_package_layout("vite+", context.package_layout.as_ref())
+        }
         InstallMethod::Pnpm => {
             describe_method_with_package_layout("pnpm", context.package_layout.as_ref())
         }
@@ -1051,62 +1028,6 @@ fn display_optional_path(path: Option<&Path>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum NpmRootCheck {
-    Match {
-        package_root: PathBuf,
-    },
-    Mismatch {
-        running_package_root: PathBuf,
-        npm_package_root: PathBuf,
-    },
-    MissingPackageRoot,
-    NpmUnavailable(String),
-}
-
-fn npm_global_root_check() -> NpmRootCheck {
-    let Some(running_package_root) = env::var_os("CODEX_MANAGED_PACKAGE_ROOT").map(PathBuf::from)
-    else {
-        return NpmRootCheck::MissingPackageRoot;
-    };
-
-    let output = match run_command(NPM_COMMAND, ["root", "-g"]) {
-        Ok(output) => output,
-        Err(err) => return NpmRootCheck::NpmUnavailable(err),
-    };
-    let Some(npm_root) = output.lines().map(str::trim).find(|line| !line.is_empty()) else {
-        return NpmRootCheck::NpmUnavailable("empty output from npm root -g".to_string());
-    };
-
-    compare_npm_package_roots(&running_package_root, &PathBuf::from(npm_root))
-}
-
-fn compare_npm_package_roots(running_package_root: &Path, npm_root: &Path) -> NpmRootCheck {
-    let npm_package_root = npm_root.join("@openai").join("codex");
-    let running = normalize_path_for_compare(running_package_root);
-    let target = normalize_path_for_compare(&npm_package_root);
-    if running == target {
-        NpmRootCheck::Match {
-            package_root: npm_package_root,
-        }
-    } else {
-        NpmRootCheck::Mismatch {
-            running_package_root: running_package_root.to_path_buf(),
-            npm_package_root,
-        }
-    }
-}
-
-fn normalize_path_for_compare(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let raw = canonical.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        raw.to_ascii_lowercase()
-    } else {
-        raw
-    }
-}
-
 fn display_list<T: AsRef<str>>(items: &[T]) -> String {
     if items.is_empty() {
         "none".to_string()
@@ -1120,37 +1041,14 @@ fn display_list<T: AsRef<str>>(items: &[T]) -> String {
 }
 
 fn codex_path_entries() -> Vec<String> {
-    #[cfg(windows)]
-    let result = run_command("where", ["codex"]);
-    #[cfg(not(windows))]
-    let result = run_command("which", ["-a", "codex"]);
-
-    result
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+    let Ok(candidates) = which::which_all("codex") else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    candidates
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .map(|path| path.display().to_string())
         .collect()
-}
-
-fn run_command<I, S>(program: &str, args: I) -> Result<String, String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            return Err(format!("exited with status {}", output.status));
-        }
-        return Err(stderr);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn config_check(config: &Config) -> DoctorCheck {
@@ -1416,6 +1314,7 @@ fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::BedrockAccessKeys => "bedrock_access_keys",
     }
 }
 
@@ -1427,6 +1326,8 @@ fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
         AuthMode::PersonalAccessToken
     } else if auth.bedrock_api_key.is_some() {
         AuthMode::BedrockApiKey
+    } else if auth.bedrock_access_keys.is_some() {
+        AuthMode::BedrockAccessKeys
     } else if auth.openai_api_key.is_some() {
         AuthMode::ApiKey
     } else {
@@ -1509,6 +1410,17 @@ fn stored_auth_issues(
                 issues.push("Bedrock API key auth is missing a Bedrock API key");
             }
         }
+        AuthMode::BedrockAccessKeys => match auth.bedrock_access_keys.as_ref() {
+            Some(access_keys) => {
+                if access_keys.access_key_id.trim().is_empty() {
+                    issues.push("Bedrock access key auth is missing an access key ID");
+                }
+                if access_keys.secret_access_key.trim().is_empty() {
+                    issues.push("Bedrock access key auth is missing a secret access key");
+                }
+            }
+            None => issues.push("Bedrock access key auth is missing AWS access keys"),
+        },
     }
     issues
 }
@@ -1722,7 +1634,7 @@ impl TerminalCheckInputs {
         let terminal_size = crossterm::terminal::size().map_err(|err| err.to_string());
         let info = terminal_info();
         let tmux_details = if matches!(info.multiplexer, Some(Multiplexer::Tmux { .. })) {
-            tmux_diagnostic_details()
+            vec!["tmux options: not inspected (PATH helpers are not executed)".to_string()]
         } else {
             Vec::new()
         };
@@ -2121,79 +2033,36 @@ fn terminal_size_issues(inputs: &TerminalCheckInputs) -> Vec<DoctorIssue> {
     issues
 }
 
-fn tmux_diagnostic_details() -> Vec<String> {
-    let mut details = Vec::new();
-    push_tmux_display_detail(&mut details, "tmux client termtype", "#{client_termtype}");
-    push_tmux_display_detail(&mut details, "tmux client termname", "#{client_termname}");
-    for option in TMUX_OPTION_NAMES {
-        let value = tmux_option_value(option).unwrap_or_else(|| "unavailable".to_string());
-        details.push(format!("tmux {option}: {value}"));
-    }
-    details
-}
-
-fn push_tmux_display_detail(details: &mut Vec<String>, label: &str, format: &str) {
-    if let Some(value) = tmux_display_message(format) {
-        details.push(format!("{label}: {value}"));
-    }
-}
-
-fn tmux_option_value(option: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["show-options", "-gqv", option])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn tmux_display_message(format: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", format])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn non_empty_trimmed(value: String) -> Option<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-async fn state_check(config: &Config) -> DoctorCheck {
+async fn state_check(config: &Config, command: &DoctorCommand) -> DoctorCheck {
     let mut details = Vec::new();
     path_readiness(&mut details, "CODEX_HOME", &config.codex_home);
     path_readiness(&mut details, "log dir", &config.log_dir);
     path_readiness(&mut details, "sqlite home", config.sqlite_config().home());
-    let mut integrity_failures = Vec::new();
+    let mut status = CheckStatus::Ok;
     for db in config.sqlite_config().runtime_db_paths() {
         path_readiness(&mut details, db.label, &db.path);
-        sqlite_integrity_detail(
-            config.sqlite_config(),
-            &mut details,
-            &mut integrity_failures,
-            db.label,
-            &db.path,
-        )
-        .await;
+        // Feedback collection gives each database its own budget; direct runs scan fully.
+        let deadline = command
+            .feedback
+            .then(|| Instant::now() + Duration::from_secs(1));
+        status = status.max(
+            sqlite_integrity_detail(
+                config.sqlite_config(),
+                &mut details,
+                db.label,
+                &db.path,
+                deadline,
+            )
+            .await,
+        );
     }
     rollout_stats_details(&mut details, &config.codex_home);
     standalone_release_cache_details(&mut details);
 
-    let status = if integrity_failures.is_empty() {
-        CheckStatus::Ok
-    } else {
-        CheckStatus::Fail
-    };
-    let summary = if status == CheckStatus::Ok {
-        "state paths and databases are inspectable"
-    } else {
-        "state database integrity check failed"
+    let summary = match status {
+        CheckStatus::Ok => "state paths and databases are inspectable",
+        CheckStatus::Warning => "some database integrity checks exceeded their time limit",
+        CheckStatus::Fail => "state database integrity check failed",
     };
     let mut check = DoctorCheck::new("state.paths", "state", status, summary).details(details);
     if status == CheckStatus::Fail {
@@ -2207,29 +2076,37 @@ async fn state_check(config: &Config) -> DoctorCheck {
 async fn sqlite_integrity_detail(
     sqlite: &codex_state::SqliteConfig,
     details: &mut Vec<String>,
-    integrity_failures: &mut Vec<String>,
     label: &str,
     path: &Path,
-) {
+    deadline: Option<Instant>,
+) -> CheckStatus {
     if !path.is_file() {
         details.push(format!("{label} integrity: skipped (missing)"));
-        return;
+        return CheckStatus::Ok;
     }
 
-    match codex_state::sqlite_integrity_check(sqlite, path).await {
-        Ok(rows) if rows.iter().all(|row| row == "ok") => {
-            details.push(format!("{label} integrity: ok"));
-        }
-        Ok(rows) => {
-            let message = format!("{label} integrity: {}", rows.join("; "));
-            integrity_failures.push(message.clone());
-            details.push(message);
-        }
+    let (rows, timed_out) = match codex_state::sqlite_integrity_check(sqlite, path, deadline).await
+    {
+        Ok(codex_state::SqliteIntegrityCheck::Complete(rows)) => (rows, false),
+        Ok(codex_state::SqliteIntegrityCheck::TimedOut(rows)) => (rows, true),
         Err(err) => {
-            let message = format!("{label} integrity: {err}");
-            integrity_failures.push(message.clone());
-            details.push(message);
+            details.push(format!("{label} integrity: {err}"));
+            return CheckStatus::Fail;
         }
+    };
+    if timed_out {
+        details.push(format!(
+            "{label} integrity: incomplete (1 second time limit)"
+        ));
+    }
+    if rows.iter().any(|row| row != "ok") {
+        details.push(format!("{label} integrity: {}", rows.join("; ")));
+        CheckStatus::Fail
+    } else if timed_out {
+        CheckStatus::Warning
+    } else {
+        details.push(format!("{label} integrity: ok"));
+        CheckStatus::Ok
     }
 }
 
@@ -2478,6 +2355,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::QuotaExceeded
         | ApiError::UsageNotIncluded
         | ApiError::Retryable { .. }
+        | ApiError::RateLimitExceeded { .. }
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
         | ApiError::CyberPolicy { .. }
@@ -2495,6 +2373,7 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
         AuthMode::AgentIdentity => "agent_identity",
         AuthMode::PersonalAccessToken => "personal_access_token",
         AuthMode::BedrockApiKey => "bedrock_api_key",
+        AuthMode::BedrockAccessKeys => "bedrock_access_keys",
     }
 }
 
@@ -2644,7 +2523,9 @@ fn provider_auth_reachability_mode_from_auth(
         return ProviderAuthReachabilityMode::Chatgpt;
     }
     match stored_auth.map(stored_auth_mode_value) {
-        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey) => ProviderAuthReachabilityMode::ApiKey,
+        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys) => {
+            ProviderAuthReachabilityMode::ApiKey
+        }
         Some(
             AuthMode::Chatgpt
             | AuthMode::ChatgptAuthTokens
@@ -3212,31 +3093,6 @@ mod tests {
     }
 
     #[test]
-    fn compare_npm_package_roots_detects_match() {
-        let running = PathBuf::from("/prefix/lib/node_modules/@openai/codex");
-        let npm_root = PathBuf::from("/prefix/lib/node_modules");
-        assert_eq!(
-            compare_npm_package_roots(&running, &npm_root),
-            NpmRootCheck::Match {
-                package_root: npm_root.join("@openai").join("codex")
-            }
-        );
-    }
-
-    #[test]
-    fn compare_npm_package_roots_detects_mismatch() {
-        let running = PathBuf::from("/old/lib/node_modules/@openai/codex");
-        let npm_root = PathBuf::from("/new/lib/node_modules");
-        assert_eq!(
-            compare_npm_package_roots(&running, &npm_root),
-            NpmRootCheck::Mismatch {
-                running_package_root: running,
-                npm_package_root: npm_root.join("@openai").join("codex"),
-            }
-        );
-    }
-
-    #[test]
     fn startup_warning_counts_group_known_sources() {
         let warnings = vec![
             "Skipped loading 2 skill(s) due to invalid SKILL.md files.".to_string(),
@@ -3566,6 +3422,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -3585,6 +3442,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -3606,6 +3464,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: Some("at-test".to_string()),
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(stored_auth_mode(&auth), "personal_access_token");
@@ -3629,6 +3488,7 @@ mod tests {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         };
 
         assert_eq!(
@@ -4323,7 +4183,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_keeps_tmux_probe_failures_non_fatal() {
+    fn terminal_check_allows_missing_tmux_details() {
         let mut inputs = terminal_inputs();
         inputs.info.multiplexer = Some(Multiplexer::Tmux { version: None });
 

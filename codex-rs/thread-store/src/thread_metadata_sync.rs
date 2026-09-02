@@ -304,6 +304,9 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::RetainedContext(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::WorldState(_) => {}
             }
@@ -581,11 +584,15 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
+            retained_context: None,
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         let first = sync
@@ -637,6 +644,7 @@ mod tests {
 
         let mut item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
             ThreadSettingsAppliedEvent {
+                thread_id: None,
                 thread_settings: ThreadSettingsSnapshot {
                     model: "gpt-5.2-codex".to_string(),
                     model_provider_id: "updated-provider".to_string(),

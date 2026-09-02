@@ -178,6 +178,22 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
 }
 
 #[tokio::test]
+async fn slash_recap_requests_generation_for_current_thread() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+
+    chat.dispatch_command(SlashCommand::Recap);
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::GenerateRecap {
+            thread_id: requested_thread_id,
+        }) if requested_thread_id == thread_id
+    );
+}
+
+#[tokio::test]
 async fn queued_slash_compact_dispatches_after_active_turn() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -807,8 +823,12 @@ async fn goal_control_slash_commands_emit_goal_events() {
         chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
         let thread_id = ThreadId::new();
         chat.thread_id = Some(thread_id);
+        chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
 
-        submit_composer_text(&mut chat, command);
+        chat.bottom_pane
+            .set_composer_text(command.into(), Vec::new(), Vec::new());
+        chat.handle_key_event(KeyCode::Esc.into());
+        chat.handle_key_event(KeyCode::Enter.into());
 
         match status {
             Some(status) => {
@@ -834,6 +854,11 @@ async fn goal_control_slash_commands_emit_goal_events() {
                 assert_eq!(actual_thread_id, thread_id);
             }
         }
+        chat.handle_key_event(KeyCode::Char('x').into());
+        chat.handle_key_event(KeyCode::Right.into());
+        chat.handle_key_event(KeyCode::Esc.into());
+        chat.handle_key_event(KeyCode::Char('.').into());
+        assert_eq!(chat.bottom_pane.composer_text(), "xx");
     }
 }
 
@@ -1215,6 +1240,78 @@ async fn slash_rename_prefills_existing_thread_name() {
 }
 
 #[tokio::test]
+async fn slash_rename_requests_and_prefills_an_editable_title_suggestion() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.thread_name = Some("Current project title".to_string());
+
+    chat.dispatch_command(SlashCommand::Rename);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("slash_rename_suggestion_loading", popup);
+
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::SuggestThreadName {
+            thread_id: requested_thread_id,
+            request_id,
+        }) => {
+            assert_eq!(requested_thread_id, thread_id);
+            request_id
+        }
+        other => panic!("expected title suggestion request, got {other:?}"),
+    };
+
+    chat.apply_thread_name_suggestion(thread_id, request_id, Some("Fix login timeout"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("slash_rename_suggestion_prefilled", popup);
+    assert_eq!(chat.thread_name.as_deref(), Some("Current project title"));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name == "Fix login timeout"
+    );
+}
+
+#[tokio::test]
+async fn slash_rename_preserves_manual_edits_when_suggestion_arrives() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+
+    chat.dispatch_command(SlashCommand::Rename);
+
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::SuggestThreadName {
+            thread_id: requested_thread_id,
+            request_id,
+        }) => {
+            assert_eq!(requested_thread_id, thread_id);
+            request_id
+        }
+        other => panic!("expected title suggestion request, got {other:?}"),
+    };
+
+    chat.handle_paste("My own title".to_string());
+    chat.apply_thread_name_suggestion(thread_id, request_id, Some("Generated title"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("My own title"));
+    assert!(!popup.contains("Generated title"));
+    assert!(!popup.contains("Generating a title suggestion"));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name == "My own title"
+    );
+}
+
+#[tokio::test]
 async fn slash_rename_without_existing_thread_name_starts_empty() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -1551,7 +1648,6 @@ async fn completed_token_activity_refresh_waits_for_active_hook() {
         ),
     );
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
     assert_matches!(rx.try_recv(), Ok(AppEvent::CommitPendingUsageOutput));
 }
 

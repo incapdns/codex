@@ -8,6 +8,7 @@ use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use crate::windows_sandbox::resolve_windows_sandbox_mode;
 use crate::windows_sandbox::resolve_windows_sandbox_private_desktop;
+use codex_agent_roles::load_agent_roles;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
@@ -72,6 +73,7 @@ use codex_features::Features;
 use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
+use codex_features::SleepToolMode;
 use codex_features::TokenBudgetConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
@@ -79,6 +81,7 @@ use codex_http_client::OutboundProxyPolicy;
 use codex_install_context::InstallContext;
 use codex_login::AuthManagerConfig;
 use codex_login::AuthRouteConfig;
+use codex_mcp::DEFAULT_OPTIONAL_MCP_STARTUP_GRACE;
 use codex_mcp::McpConfig;
 use codex_mcp::McpPluginAttribution;
 use codex_mcp::McpProtocolMode;
@@ -121,6 +124,7 @@ use codex_protocol::permissions::ReadDenyMatcher;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_rmcp_client::McpOAuthRefreshMode;
 pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
@@ -139,6 +143,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::permissions::BUILT_IN_READ_ONLY_PROFILE;
 use crate::config::permissions::BUILT_IN_WORKSPACE_PROFILE;
@@ -155,7 +160,6 @@ use codex_network_proxy::NetworkProxyConfig;
 use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
-pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
 mod managed_features;
@@ -170,6 +174,7 @@ mod resolved_permission_profile;
 mod schema;
 pub use auth_keyring::bootstrap_auth_config;
 pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
+pub use codex_agent_roles::AgentRoleConfig;
 pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;
 pub use codex_config::ConstraintError;
@@ -188,7 +193,9 @@ use permission_profile_catalog::permission_profile_is_allowed;
 use permission_profile_catalog::validate_permission_profile_for_deny_read;
 pub use permission_profile_selection::ResolvedPermissionProfileSelection;
 pub use permission_profile_selection::resolve_permission_profile_selection;
+pub use permissions::compile_permission_profile;
 pub(crate) use permissions::is_builtin_permission_profile_name;
+pub use permissions::resolve_permission_profile;
 pub(crate) use resolved_permission_profile::PermissionProfileState;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
@@ -736,6 +743,9 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
+    /// Generate automatic TUI recaps. Manual `/recap` remains available when disabled.
+    pub tui_auto_recap: bool,
+
     /// Persisted startup availability NUX state for model tooltips.
     pub model_availability_nux: ModelAvailabilityNuxConfig,
 
@@ -843,6 +853,9 @@ pub struct Config {
     /// of the local listener address. The local callback listener still binds
     /// to 127.0.0.1 (using `mcp_oauth_callback_port` when provided).
     pub mcp_oauth_callback_url: Option<String>,
+
+    /// How long to wait for optional MCP servers while building the initial tool catalog.
+    pub mcp_optional_startup_grace: Duration,
 
     /// Combined provider map (defaults plus user-defined providers).
     pub model_providers: HashMap<String, ModelProviderInfo>,
@@ -1024,6 +1037,9 @@ pub struct Config {
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: u64,
 
+    /// Idle timeout for unsubscribed app-server threads, resolved at server startup.
+    pub thread_unload_delay: Duration,
+
     /// Compatibility-only settings retained for legacy `ghost_snapshot`
     /// config loading.
     pub ghost_snapshot: GhostSnapshotConfig,
@@ -1037,6 +1053,8 @@ pub struct Config {
     pub rollout_budget: Option<RolloutBudgetConfig>,
     /// Current-time reminder and clock tool configuration, when enabled.
     pub current_time_reminder: Option<CurrentTimeReminderConfig>,
+    /// How the sleep tool is selected when its feature gate is enabled.
+    pub sleep_tool_mode: SleepToolMode,
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
@@ -1489,6 +1507,17 @@ impl Config {
         &self.sqlite
     }
 
+    /// Whether Guardian may use the unmetered Codex inference endpoints.
+    pub fn free_guardian_enabled(&self) -> bool {
+        self.config_layer_stack
+            .effective_config()
+            .get("features")
+            .and_then(|features| features.get("guardianv2"))
+            .and_then(|guardian| guardian.get("free_guardian"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// Resolves the configured, reviewer-catalog, or bundled Guardian policy.
     pub fn resolve_guardian_policy<'a>(
         &'a self,
@@ -1688,7 +1717,8 @@ impl Config {
                     plugin.config_name.clone(),
                     plugin.display_name().to_string(),
                 )
-            };
+            }
+            .with_host_root(PathUri::from_abs_path(&plugin.root));
             for (name, plugin_server) in plugin_mcp_servers {
                 catalog.register(McpServerRegistration::from_plugin(
                     name,
@@ -1713,9 +1743,15 @@ impl Config {
             apps_mcp_product_sku: self.apps_mcp_product_sku.clone(),
             codex_home: self.codex_home.to_path_buf(),
             mcp_oauth_credentials_store_mode: self.mcp_oauth_credentials_store_mode,
+            oauth_refresh_mode: if self.features.enabled(Feature::McpOAuthRefreshCoordination) {
+                McpOAuthRefreshMode::Coordinated
+            } else {
+                McpOAuthRefreshMode::Legacy
+            },
             auth_keyring_backend_kind: self.auth_keyring_backend_kind(),
             mcp_oauth_callback_port: self.mcp_oauth_callback_port,
             mcp_oauth_callback_url: self.mcp_oauth_callback_url.clone(),
+            optional_mcp_startup_grace: self.mcp_optional_startup_grace,
             skill_mcp_dependency_install_enabled: self
                 .features
                 .enabled(Feature::SkillMcpDependencyInstall),
@@ -1724,6 +1760,7 @@ impl Config {
             config_layer_stack: self.config_layer_stack.clone(),
             approvals_reviewer: self.approvals_reviewer,
             environment_cwds: HashMap::new(),
+            server_permission_profiles: HashMap::new(),
             codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.clone(),
             use_legacy_landlock: self.features.use_legacy_landlock(),
             apps_enabled: self.features.enabled(Feature::Apps),
@@ -2308,17 +2345,6 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
         .map_err(|err| std::io::Error::other(format!("failed to persist config.toml: {err}")))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AgentRoleConfig {
-    /// Human-facing role documentation used in spawn tool guidance.
-    /// Required for loaded user-defined roles after deprecated/new metadata precedence resolves.
-    pub description: Option<String>,
-    /// Path to a role-specific config layer.
-    pub config_file: Option<PathBuf>,
-    /// Candidate nicknames for agents spawned with this role.
-    pub nickname_candidates: Option<Vec<String>>,
-}
-
 fn resolve_tool_suggest_config(
     config_toml: &ConfigToml,
     config_layer_stack: &ConfigLayerStack,
@@ -2627,7 +2653,7 @@ fn resolve_update_plan_enabled(config_toml: &ConfigToml) -> bool {
         .tools
         .as_ref()
         .and_then(|tools| tools.update_plan.as_ref())
-        .is_none_or(|config| config.enabled)
+        .is_some_and(|config| config.enabled)
 }
 
 fn resolve_orchestrator_feature_enabled(
@@ -3602,6 +3628,8 @@ impl Config {
                     network_proxy,
                 );
             }
+            configured_network_proxy_config
+                .set_credential_broker_openai_base_url(cfg.openai_base_url.as_deref());
             configured_network_proxy_config.enabled = true;
         }
         if cfg.approval_policy == Some(AskForApproval::UnlessTrusted) {
@@ -3671,11 +3699,19 @@ impl Config {
         let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
+        let sleep_tool_mode = cfg
+            .features
+            .as_ref()
+            .and_then(|features| features.sleep_tool.as_ref())
+            .and_then(|feature| match feature {
+                FeatureToml::Enabled(_) => None,
+                FeatureToml::Config(config) => config.mode,
+            })
+            .unwrap_or_default();
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
-            agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
-                .await?;
+            load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings).await?;
 
         let openai_base_url = cfg
             .openai_base_url
@@ -3780,6 +3816,17 @@ impl Config {
             .background_terminal_max_timeout
             .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
             .max(MIN_EMPTY_YIELD_TIME_MS);
+        let thread_unload_delay =
+            Duration::from_secs(cfg.thread_unload_delay_secs.unwrap_or(/*default*/ 60));
+        if std::time::Instant::now()
+            .checked_add(thread_unload_delay)
+            .is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "thread_unload_delay_secs is too large",
+            ));
+        }
 
         let ghost_snapshot = {
             let mut config = GhostSnapshotConfig::default();
@@ -4159,6 +4206,10 @@ impl Config {
             ),
             mcp_oauth_callback_port: cfg.mcp_oauth_callback_port,
             mcp_oauth_callback_url: cfg.mcp_oauth_callback_url.clone(),
+            mcp_optional_startup_grace: cfg
+                .mcp_optional_startup_grace_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_OPTIONAL_MCP_STARTUP_GRACE),
             model_providers,
             project_doc_max_bytes: cfg.project_doc_max_bytes.unwrap_or(AGENTS_MD_MAX_BYTES),
             project_doc_fallback_filenames: cfg
@@ -4261,11 +4312,13 @@ impl Config {
             tool_registry,
             code_mode,
             background_terminal_max_timeout,
+            thread_unload_delay,
             ghost_snapshot,
             multi_agent_v2,
             token_budget,
             rollout_budget,
             current_time_reminder,
+            sleep_tool_mode,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning
@@ -4273,7 +4326,12 @@ impl Config {
             active_project,
             notices,
             check_for_update_on_startup,
-            disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
+            disable_paste_burst: cfg
+                .tui
+                .as_ref()
+                .and_then(|tui| tui.disable_paste_burst)
+                .or(cfg.disable_paste_burst)
+                .unwrap_or(false),
             analytics_enabled: cfg.analytics.as_ref().and_then(|a| a.enabled),
             feedback_enabled: cfg
                 .feedback
@@ -4288,6 +4346,7 @@ impl Config {
                 .unwrap_or_default(),
             animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
+            tui_auto_recap: cfg.tui.as_ref().map(|t| t.auto_recap).unwrap_or(/*default*/ true),
             model_availability_nux: cfg
                 .tui
                 .as_ref()
@@ -4475,6 +4534,8 @@ impl Config {
                         network_proxy,
                     );
                 }
+                configured_network_proxy_config
+                    .set_credential_broker_openai_base_url(cfg.openai_base_url.as_deref());
                 configured_network_proxy_config.enabled = true;
             }
             configured_network_proxy_config
